@@ -13,6 +13,7 @@ import (
 
 type PortInfo struct {
 	Name    string     `json:"name"`
+	MAC     string     `json:"mac,omitempty"`
 	Up      bool       `json:"up"`
 	Carrier bool       `json:"carrier"`
 	TxBytes uint64     `json:"txBytes"`
@@ -73,18 +74,18 @@ func main() {
 
 	// Ports table (wan, lan1-4, wifi)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "IFACE\tRX\tTX\tRX PKTS\tTX PKTS\n")
+	fmt.Fprintf(w, "IFACE\tMAC\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
 		if len(p.Sub) > 0 {
 			// Show sub-ports directly (e.g. lan1-lan4 instead of lan)
 			for _, sub := range p.Sub {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
-					sub.Name, humanBytes(sub.RxBytes), humanBytes(sub.TxBytes),
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n",
+					sub.Name, sub.MAC, humanBytes(sub.RxBytes), humanBytes(sub.TxBytes),
 					sub.RxPkts, sub.TxPkts)
 			}
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
-				p.Name, humanBytes(p.RxBytes), humanBytes(p.TxBytes),
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n",
+				p.Name, p.MAC, humanBytes(p.RxBytes), humanBytes(p.TxBytes),
 				p.RxPkts, p.TxPkts)
 		}
 	}

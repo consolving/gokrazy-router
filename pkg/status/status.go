@@ -17,6 +17,7 @@ import (
 // PortInfo describes the link state and traffic counters for a network port.
 type PortInfo struct {
 	Name    string      `json:"name"`
+	MAC     string      `json:"mac,omitempty"`
 	Up      bool        `json:"up"`
 	Carrier bool        `json:"carrier"`
 	TxBytes uint64      `json:"txBytes"`
@@ -30,7 +31,7 @@ type PortInfo struct {
 type ClientInfo struct {
 	IP      string `json:"ip"`
 	MAC     string `json:"mac"`
-	Via     string `json:"via"`      // "L" = LAN, "W" = WiFi
+	Via     string `json:"via"`      // "L" = LAN, "W" = WiFi, "G" = Gateway (router itself)
 	TxBytes uint64 `json:"txBytes"`  // bytes sent TO client (download)
 	RxBytes uint64 `json:"rxBytes"`  // bytes sent FROM client (upload)
 	TxPkts  uint64 `json:"txPackets"`
@@ -55,16 +56,17 @@ type Status struct {
 
 // Monitor tracks per-client nftables counter rules and provides status.
 type Monitor struct {
-	mu        sync.Mutex
-	conn      *nftables.Conn
-	table     *nftables.Table
-	chainRx   *nftables.Chain // traffic FROM clients (src match)
-	chainTx   *nftables.Chain // traffic TO clients (dst match)
-	clients   map[string]clientEntry // IP -> entry
-	wanIface  string
-	lanIface  string   // bridge name (br-lan)
-	lanPorts  []string // individual LAN ports (lan1-lan4)
-	wifiIface string
+	mu         sync.Mutex
+	conn       *nftables.Conn
+	table      *nftables.Table
+	chainRx    *nftables.Chain // traffic FROM clients (src match)
+	chainTx    *nftables.Chain // traffic TO clients (dst match)
+	clients    map[string]clientEntry // IP -> entry
+	gatewayIPs map[string]bool        // router's own IPs (to mark as "G")
+	wanIface   string
+	lanIface   string   // bridge name (br-lan)
+	lanPorts   []string // individual LAN ports (lan1-lan4)
+	wifiIface  string
 }
 
 type clientEntry struct {
@@ -107,16 +109,33 @@ func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monit
 		return nil, fmt.Errorf("status: create nftables table: %w", err)
 	}
 
+	// Collect the router's own IPs to identify gateway entries in client list.
+	gwIPs := make(map[string]bool)
+	for _, ifname := range []string{lanIface, wifiIface, wanIface} {
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			continue
+		}
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			gwIPs[a.IP.String()] = true
+		}
+	}
+
 	return &Monitor{
-		conn:      conn,
-		table:     table,
-		chainRx:   chainRx,
-		chainTx:   chainTx,
-		clients:   make(map[string]clientEntry),
-		wanIface:  wanIface,
-		lanIface:  lanIface,
-		lanPorts:  lanPorts,
-		wifiIface: wifiIface,
+		conn:       conn,
+		table:      table,
+		chainRx:    chainRx,
+		chainTx:    chainTx,
+		clients:    make(map[string]clientEntry),
+		gatewayIPs: gwIPs,
+		wanIface:   wanIface,
+		lanIface:   lanIface,
+		lanPorts:   lanPorts,
+		wifiIface:  wifiIface,
 	}, nil
 }
 
@@ -129,6 +148,11 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	ipStr := ip.To4().String()
 	if _, exists := m.clients[ipStr]; exists {
 		return nil // already tracked
+	}
+
+	// Mark router's own IPs as gateway.
+	if m.gatewayIPs[ipStr] {
+		via = "G"
 	}
 
 	ip4 := ip.To4()
@@ -192,6 +216,9 @@ func getPortInfo(name string) PortInfo {
 		return pi
 	}
 	attrs := link.Attrs()
+	if hw := attrs.HardwareAddr; len(hw) > 0 {
+		pi.MAC = hw.String()
+	}
 	pi.Up = attrs.Flags&net.FlagUp != 0
 	pi.Carrier = attrs.OperState == netlink.OperUp
 	if stats := attrs.Statistics; stats != nil {
