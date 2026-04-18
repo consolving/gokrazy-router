@@ -15,6 +15,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
 	"github.com/consolving/gokrazy-router/pkg/status"
 	"github.com/consolving/gokrazy-router/pkg/wifi"
+	"github.com/vishvananda/netlink"
 )
 
 func main() {
@@ -56,11 +57,11 @@ func main() {
 
 	// 4. Start status monitor (nftables per-client counters).
 	monitorPorts := append([]string{cfg.NAT.OutInterface}, cfg.LAN.Interfaces...)
-	if cfg.WiFi.Interface != "" {
-		monitorPorts = append(monitorPorts, cfg.WiFi.Interface)
-	} else {
-		monitorPorts = append(monitorPorts, "wlan0") // default
+	wifiIface := cfg.WiFi.Interface
+	if wifiIface == "" {
+		wifiIface = "wlan0"
 	}
+	monitorPorts = append(monitorPorts, wifiIface)
 	mon, err := status.New(monitorPorts)
 	if err != nil {
 		log.Printf("status monitor: %v (continuing without)", err)
@@ -69,29 +70,53 @@ func main() {
 	// 5. Start WiFi AP (hostapd).
 	var wifiAP *wifi.AP
 	if cfg.WiFi.Enabled {
-		ap, err := wifi.New(cfg.WiFi, cfg.LAN.Bridge)
+		// Determine bridge parameter: if WiFi has its own address (routed mode),
+		// don't pass bridge to hostapd. Otherwise, bridge into LAN bridge.
+		wifiBridge := ""
+		if cfg.WiFi.Bridge != "" && cfg.WiFi.Address == "" {
+			wifiBridge = cfg.WiFi.Bridge
+		}
+
+		ap, err := wifi.New(cfg.WiFi, wifiBridge)
 		if err != nil {
 			log.Fatalf("wifi: %v", err)
 		}
 
-		// Log WLAN client events and optionally track in status monitor.
-		if mon != nil {
-			ap.OnClient(func(ev wifi.ClientEvent) {
-				if ev.Associated {
-					log.Printf("wifi: client %s connected via WLAN", ev.MAC)
-				} else {
-					log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
-				}
-			})
-		}
+		// Log WLAN client events.
+		ap.OnClient(func(ev wifi.ClientEvent) {
+			if ev.Associated {
+				log.Printf("wifi: client %s connected via WLAN", ev.MAC)
+			} else {
+				log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
+			}
+		})
 
 		if err := ap.Start(); err != nil {
 			log.Fatalf("wifi: start: %v", err)
 		}
 		wifiAP = ap
+
+		// Routed mode: assign IP to wlan0, add NAT for WiFi subnet.
+		if cfg.WiFi.Address != "" {
+			if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
+				log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
+			}
+			log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
+
+			// Add WiFi subnet to NAT masquerade.
+			if natMgr != nil {
+				_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
+				if err != nil {
+					log.Fatalf("parse WiFi CIDR: %v", err)
+				}
+				if err := natMgr.AddSource(wifiNet); err != nil {
+					log.Fatalf("nat: add WiFi source: %v", err)
+				}
+			}
+		}
 	}
 
-	// 6. Start DHCP server (serves both wired and wireless clients via br-lan).
+	// 6. Start DHCP server on LAN bridge.
 	if cfg.LAN.DHCP.Enabled {
 		srv, err := dhcp.New(
 			cfg.LAN.Bridge,
@@ -116,12 +141,41 @@ func main() {
 
 		go func() {
 			if err := srv.Run(); err != nil {
-				log.Fatalf("dhcp server: %v", err)
+				log.Fatalf("dhcp server (LAN): %v", err)
 			}
 		}()
 	}
 
-	// 7. Start status HTTP API.
+	// 7. Start DHCP server on WiFi interface (routed mode only).
+	if cfg.WiFi.Enabled && cfg.WiFi.Address != "" && cfg.WiFi.DHCP.Enabled {
+		srv, err := dhcp.New(
+			wifiIface,
+			cfg.WiFi.Address,
+			cfg.WiFi.DHCP.RangeStart,
+			cfg.WiFi.DHCP.RangeEnd,
+			cfg.WiFi.DHCP.DNS,
+			cfg.WiFi.DHCP.ParseLeaseDuration(),
+		)
+		if err != nil {
+			log.Fatalf("dhcp wifi: %v", err)
+		}
+
+		if mon != nil {
+			srv.OnLease(func(ip net.IP, mac string) {
+				if err := mon.AddClient(ip, mac); err != nil {
+					log.Printf("status: failed to add WiFi client %s: %v", ip, err)
+				}
+			})
+		}
+
+		go func() {
+			if err := srv.Run(); err != nil {
+				log.Fatalf("dhcp server (WiFi): %v", err)
+			}
+		}()
+	}
+
+	// 8. Start status HTTP API.
 	if mon != nil {
 		http.Handle("/status", mon)
 		go func() {
@@ -148,4 +202,22 @@ func main() {
 	if natMgr != nil {
 		natMgr.Cleanup()
 	}
+}
+
+// assignIP assigns a CIDR address to the named interface and brings it up.
+func assignIP(ifaceName, cidr string) error {
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return err
+	}
+	addr, err := netlink.ParseAddr(cidr)
+	if err != nil {
+		return err
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+	return netlink.LinkSetUp(link)
 }

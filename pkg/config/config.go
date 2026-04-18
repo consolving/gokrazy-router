@@ -49,17 +49,18 @@ type NATConfig struct {
 }
 
 type WiFiConfig struct {
-	Enabled     bool   `json:"enabled"`
-	Interface   string `json:"interface"`
-	Bridge      string `json:"bridge"`
-	HostapdBin  string `json:"hostapdBin"`
-	SSID        string `json:"ssid"`
-	Passphrase  string `json:"passphrase"`
-	Channel     int    `json:"channel"`
-	HWMode      string `json:"hwMode"`      // "g" for 2.4GHz, "a" for 5GHz
-	HTCapab     string `json:"htCapab"`      // e.g. "[HT40+][SHORT-GI-20]"
-	CountryCode string `json:"countryCode"`
-	WPA         int    `json:"wpa"`          // 2 for WPA2
+	Enabled     bool       `json:"enabled"`
+	Interface   string     `json:"interface"`
+	Bridge      string     `json:"bridge"`      // if empty, wlan0 gets its own subnet (recommended for rtl8xxxu)
+	Address     string     `json:"address"`      // CIDR for wlan0 when not bridged, e.g. "10.0.1.1/24"
+	DHCP        DHCPConfig `json:"dhcp"`         // DHCP pool for WiFi clients (when not bridged)
+	SSID        string     `json:"ssid"`
+	Passphrase  string     `json:"passphrase"`
+	Channel     int        `json:"channel"`
+	HWMode      string     `json:"hwMode"`       // "g" for 2.4GHz, "a" for 5GHz
+	HTCapab     string     `json:"htCapab"`      // e.g. "[HT40+][SHORT-GI-20]"
+	CountryCode string     `json:"countryCode"`
+	WPA         int        `json:"wpa"`          // 2 for WPA2
 }
 
 func (d DHCPConfig) ParseLeaseDuration() time.Duration {

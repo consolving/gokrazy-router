@@ -13,8 +13,10 @@ import (
 // Manager holds the nftables connection and references to created objects
 // so they can be cleaned up on shutdown.
 type Manager struct {
-	conn  *nftables.Conn
-	table *nftables.Table
+	conn     *nftables.Conn
+	table    *nftables.Table
+	chain    *nftables.Chain
+	outIface string
 }
 
 // Setup creates the NAT masquerade rules: traffic from srcNet going out
@@ -97,7 +99,53 @@ func Setup(outIface string, srcNet *net.IPNet) (*Manager, error) {
 
 	log.Printf("nat: masquerade %s/%d via %s (ifindex %d)", srcNet.IP, ones, outIface, iface.Index)
 
-	return &Manager{conn: conn, table: table}, nil
+	return &Manager{conn: conn, table: table, chain: chain, outIface: outIface}, nil
+}
+
+// AddSource adds an additional source network to the masquerade rules.
+func (m *Manager) AddSource(srcNet *net.IPNet) error {
+	ones, _ := srcNet.Mask.Size()
+	m.conn.AddRule(&nftables.Rule{
+		Table: m.table,
+		Chain: m.chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       12,
+				Len:          4,
+			},
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           srcNet.Mask,
+				Xor:            net.IPv4Mask(0, 0, 0, 0),
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     srcNet.IP.To4(),
+			},
+			&expr.Meta{
+				Key:      expr.MetaKeyOIFNAME,
+				Register: 1,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     ifname(m.outIface),
+			},
+			&expr.Masq{},
+		},
+	})
+
+	if err := m.conn.Flush(); err != nil {
+		return fmt.Errorf("nftables flush: %w", err)
+	}
+
+	log.Printf("nat: added masquerade for %s/%d via %s", srcNet.IP, ones, m.outIface)
+	return nil
 }
 
 // Cleanup removes the NAT table and all its rules.
