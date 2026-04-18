@@ -127,8 +127,18 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		return
 	}
 
-	if _, err := conn.WriteTo(resp.ToBytes(), peer); err != nil {
-		log.Printf("dhcp: error sending reply: %v", err)
+	// DHCP clients without an IP send from 0.0.0.0 — we must reply to broadcast.
+	dst := peer
+	if upeer, ok := peer.(*net.UDPAddr); ok {
+		if upeer.IP == nil || upeer.IP.To4().Equal(net.IPv4zero) {
+			dst = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
+		}
+	}
+
+	if _, err := conn.WriteTo(resp.ToBytes(), dst); err != nil {
+		log.Printf("dhcp: error sending reply to %s: %v", dst, err)
+	} else {
+		log.Printf("dhcp: sent %s to %s", resp.MessageType(), dst)
 	}
 }
 
