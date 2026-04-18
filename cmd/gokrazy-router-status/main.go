@@ -71,24 +71,9 @@ func main() {
 		return
 	}
 
-	// Summary
-	if len(s.Summary) > 0 {
-		fmt.Println("SUMMARY")
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(w, "IFACE\tRX\tTX\tRX PKTS\tTX PKTS\n")
-		for _, si := range s.Summary {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
-				si.Name, humanBytes(si.RxBytes), humanBytes(si.TxBytes),
-				si.RxPkts, si.TxPkts)
-		}
-		w.Flush()
-		fmt.Println()
-	}
-
-	// Ports table
-	fmt.Println("PORTS")
+	// Ports table (wan, lan with sub-ports, wifi)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "NAME\tSTATUS\tRX\tTX\tRX PKTS\tTX PKTS\n")
+	fmt.Fprintf(w, "IFACE\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
 		printPort(w, p, "")
 	}
@@ -116,14 +101,8 @@ func main() {
 }
 
 func printPort(w *tabwriter.Writer, p PortInfo, prefix string) {
-	st := "DOWN"
-	if p.Up && p.Carrier {
-		st = "UP"
-	} else if p.Up {
-		st = "NO-LINK"
-	}
-	fmt.Fprintf(w, "%s%s\t%s\t%s\t%s\t%d\t%d\n",
-		prefix, p.Name, st,
+	fmt.Fprintf(w, "%s%s\t%s\t%s\t%d\t%d\n",
+		prefix, p.Name,
 		humanBytes(p.RxBytes), humanBytes(p.TxBytes),
 		p.RxPkts, p.TxPkts)
 	for _, sub := range p.Sub {
