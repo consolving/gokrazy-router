@@ -71,11 +71,22 @@ func main() {
 		return
 	}
 
-	// Ports table (wan, lan with sub-ports, wifi)
+	// Ports table (wan, lan1-4, wifi)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "IFACE\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
-		printPort(w, p, "")
+		if len(p.Sub) > 0 {
+			// Show sub-ports directly (e.g. lan1-lan4 instead of lan)
+			for _, sub := range p.Sub {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
+					sub.Name, humanBytes(sub.RxBytes), humanBytes(sub.TxBytes),
+					sub.RxPkts, sub.TxPkts)
+			}
+		} else {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
+				p.Name, humanBytes(p.RxBytes), humanBytes(p.TxBytes),
+				p.RxPkts, p.TxPkts)
+		}
 	}
 	w.Flush()
 
@@ -97,16 +108,6 @@ func main() {
 		w.Flush()
 	} else {
 		fmt.Println("\nNo clients connected.")
-	}
-}
-
-func printPort(w *tabwriter.Writer, p PortInfo, prefix string) {
-	fmt.Fprintf(w, "%s%s\t%s\t%s\t%d\t%d\n",
-		prefix, p.Name,
-		humanBytes(p.RxBytes), humanBytes(p.TxBytes),
-		p.RxPkts, p.TxPkts)
-	for _, sub := range p.Sub {
-		printPort(w, sub, "  ")
 	}
 }
 
