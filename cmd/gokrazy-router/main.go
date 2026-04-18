@@ -55,6 +55,11 @@ func main() {
 
 	// 4. Start status monitor (nftables per-client counters).
 	monitorPorts := append([]string{cfg.NAT.OutInterface}, cfg.LAN.Interfaces...)
+	if cfg.WiFi.Interface != "" {
+		monitorPorts = append(monitorPorts, cfg.WiFi.Interface)
+	} else {
+		monitorPorts = append(monitorPorts, "wlan0") // default
+	}
 	mon, err := status.New(monitorPorts)
 	if err != nil {
 		log.Printf("status monitor: %v (continuing without)", err)
