@@ -14,6 +14,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
 	"github.com/consolving/gokrazy-router/pkg/status"
+	"github.com/consolving/gokrazy-router/pkg/wifi"
 )
 
 func main() {
@@ -65,7 +66,32 @@ func main() {
 		log.Printf("status monitor: %v (continuing without)", err)
 	}
 
-	// 5. Start DHCP server.
+	// 5. Start WiFi AP (hostapd).
+	var wifiAP *wifi.AP
+	if cfg.WiFi.Enabled {
+		ap, err := wifi.New(cfg.WiFi, cfg.LAN.Bridge)
+		if err != nil {
+			log.Fatalf("wifi: %v", err)
+		}
+
+		// Log WLAN client events and optionally track in status monitor.
+		if mon != nil {
+			ap.OnClient(func(ev wifi.ClientEvent) {
+				if ev.Associated {
+					log.Printf("wifi: client %s connected via WLAN", ev.MAC)
+				} else {
+					log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
+				}
+			})
+		}
+
+		if err := ap.Start(); err != nil {
+			log.Fatalf("wifi: start: %v", err)
+		}
+		wifiAP = ap
+	}
+
+	// 6. Start DHCP server (serves both wired and wireless clients via br-lan).
 	if cfg.LAN.DHCP.Enabled {
 		srv, err := dhcp.New(
 			cfg.LAN.Bridge,
@@ -95,7 +121,7 @@ func main() {
 		}()
 	}
 
-	// 6. Start status HTTP API.
+	// 7. Start status HTTP API.
 	if mon != nil {
 		http.Handle("/status", mon)
 		go func() {
@@ -116,6 +142,9 @@ func main() {
 	log.Printf("received %v, shutting down", sig)
 
 	// Cleanup.
+	if wifiAP != nil {
+		wifiAP.Stop()
+	}
 	if natMgr != nil {
 		natMgr.Cleanup()
 	}
