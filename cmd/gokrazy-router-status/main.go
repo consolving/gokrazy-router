@@ -1,0 +1,107 @@
+// Command gokrazy-router-status queries the router's status API and displays
+// port link states and per-client traffic counters.
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"text/tabwriter"
+)
+
+type PortInfo struct {
+	Name    string `json:"name"`
+	Up      bool   `json:"up"`
+	Carrier bool   `json:"carrier"`
+	TxBytes uint64 `json:"txBytes"`
+	RxBytes uint64 `json:"rxBytes"`
+	TxPkts  uint64 `json:"txPackets"`
+	RxPkts  uint64 `json:"rxPackets"`
+}
+
+type ClientInfo struct {
+	IP      string `json:"ip"`
+	MAC     string `json:"mac"`
+	TxBytes uint64 `json:"txBytes"`
+	RxBytes uint64 `json:"rxBytes"`
+	TxPkts  uint64 `json:"txPackets"`
+	RxPkts  uint64 `json:"rxPackets"`
+}
+
+type Status struct {
+	Ports   []PortInfo   `json:"ports"`
+	Clients []ClientInfo `json:"clients"`
+}
+
+func main() {
+	host := flag.String("host", "10.0.0.1:8080", "router status API address")
+	jsonOut := flag.Bool("json", false, "output raw JSON")
+	flag.Parse()
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/status", *host))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var s Status
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		fmt.Fprintf(os.Stderr, "error decoding response: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(s)
+		return
+	}
+
+	// Ports table
+	fmt.Println("PORTS")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "NAME\tSTATUS\tRX PKTS\tTX PKTS\tRX\tTX\n")
+	for _, p := range s.Ports {
+		st := "DOWN"
+		if p.Up && p.Carrier {
+			st = "UP"
+		} else if p.Up {
+			st = "NO-LINK"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
+			p.Name, st, p.RxPkts, p.TxPkts,
+			humanBytes(p.RxBytes), humanBytes(p.TxBytes))
+	}
+	w.Flush()
+
+	if len(s.Clients) > 0 {
+		fmt.Println()
+		fmt.Println("CLIENTS")
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(w, "IP\tMAC\tUL PKTS\tDL PKTS\tUL\tDL\n")
+		for _, c := range s.Clients {
+			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
+				c.IP, c.MAC, c.RxPkts, c.TxPkts,
+				humanBytes(c.RxBytes), humanBytes(c.TxBytes))
+		}
+		w.Flush()
+	} else {
+		fmt.Println("\nNo clients connected.")
+	}
+}
+
+func humanBytes(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(b)/float64(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(b)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}

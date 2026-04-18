@@ -12,6 +12,9 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 )
 
+// LeaseCallback is called when a new client gets a lease.
+type LeaseCallback func(ip net.IP, mac string)
+
 // Server is a minimal DHCPv4 server that hands out leases from a
 // configured range on a specific interface.
 type Server struct {
@@ -24,9 +27,10 @@ type Server struct {
 	lease     time.Duration
 	router    net.IP
 
-	mu     sync.Mutex
-	leases map[string]lease // MAC -> lease
-	nextIP net.IP
+	mu        sync.Mutex
+	leases    map[string]lease // MAC -> lease
+	nextIP    net.IP
+	onLease   LeaseCallback
 }
 
 type lease struct {
@@ -69,6 +73,11 @@ func New(iface, serverAddr, rangeStart, rangeEnd string, dns []string, leaseDur 
 		nextIP:     dupIP(rs),
 	}
 	return s, nil
+}
+
+// OnLease registers a callback for new lease assignments.
+func (s *Server) OnLease(cb LeaseCallback) {
+	s.onLease = cb
 }
 
 // Run starts the DHCP server. It blocks until an error occurs.
@@ -171,6 +180,12 @@ func (s *Server) allocate(mac string) net.IP {
 	if ipGreater(s.nextIP, s.rangeEnd) {
 		s.nextIP = dupIP(s.rangeStart)
 	}
+
+	// Notify callback (outside the hot path — fire and forget).
+	if s.onLease != nil {
+		go s.onLease(dupIP(ip), mac)
+	}
+
 	return ip
 }
 

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/dhcp"
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
+	"github.com/consolving/gokrazy-router/pkg/status"
 )
 
 func main() {
@@ -51,7 +53,14 @@ func main() {
 		}
 	}
 
-	// 4. Start DHCP server.
+	// 4. Start status monitor (nftables per-client counters).
+	monitorPorts := append([]string{cfg.NAT.OutInterface}, cfg.LAN.Interfaces...)
+	mon, err := status.New(monitorPorts)
+	if err != nil {
+		log.Printf("status monitor: %v (continuing without)", err)
+	}
+
+	// 5. Start DHCP server.
 	if cfg.LAN.DHCP.Enabled {
 		srv, err := dhcp.New(
 			cfg.LAN.Bridge,
@@ -64,9 +73,31 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp: %v", err)
 		}
+
+		// Register lease callback for traffic monitoring.
+		if mon != nil {
+			srv.OnLease(func(ip net.IP, mac string) {
+				if err := mon.AddClient(ip, mac); err != nil {
+					log.Printf("status: failed to add client %s: %v", ip, err)
+				}
+			})
+		}
+
 		go func() {
 			if err := srv.Run(); err != nil {
 				log.Fatalf("dhcp server: %v", err)
+			}
+		}()
+	}
+
+	// 6. Start status HTTP API.
+	if mon != nil {
+		http.Handle("/status", mon)
+		go func() {
+			addr := ":8080"
+			log.Printf("status API listening on %s", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Printf("status API: %v", err)
 			}
 		}()
 	}
