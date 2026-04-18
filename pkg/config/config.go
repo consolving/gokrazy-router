@@ -7,10 +7,11 @@ import (
 )
 
 type Config struct {
-	WAN  WANConfig  `json:"wan"`
-	LAN  LANConfig  `json:"lan"`
+	WAN   WANConfig    `json:"wan"`
+	LAN   LANConfig    `json:"lan"`
 	VLANs []VLANConfig `json:"vlans,omitempty"`
-	NAT  NATConfig  `json:"nat"`
+	NAT   NATConfig    `json:"nat"`
+	WiFi  WiFiConfig   `json:"wifi,omitempty"`
 }
 
 type WANConfig struct {
@@ -45,6 +46,20 @@ type VLANConfig struct {
 type NATConfig struct {
 	Enabled      bool   `json:"enabled"`
 	OutInterface string `json:"outInterface"`
+}
+
+type WiFiConfig struct {
+	Enabled     bool   `json:"enabled"`
+	Interface   string `json:"interface"`
+	Bridge      string `json:"bridge"`
+	HostapdBin  string `json:"hostapdBin"`
+	SSID        string `json:"ssid"`
+	Passphrase  string `json:"passphrase"`
+	Channel     int    `json:"channel"`
+	HWMode      string `json:"hwMode"`      // "g" for 2.4GHz, "a" for 5GHz
+	HTCapab     string `json:"htCapab"`      // e.g. "[HT40+][SHORT-GI-20]"
+	CountryCode string `json:"countryCode"`
+	WPA         int    `json:"wpa"`          // 2 for WPA2
 }
 
 func (d DHCPConfig) ParseLeaseDuration() time.Duration {
