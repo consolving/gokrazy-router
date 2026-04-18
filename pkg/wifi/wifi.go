@@ -64,6 +64,8 @@ ht_capab={{.HTCapab}}
 ieee80211n=1
 {{- end}}
 wmm_enabled=1
+wds_sta=1
+ap_isolate=0
 
 # WPA2-PSK
 wpa={{.WPA}}
