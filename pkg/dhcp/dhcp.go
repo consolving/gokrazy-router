@@ -105,6 +105,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptRouter(s.router)),
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
+			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
 		)
 	case dhcpv4.MessageTypeRequest:
 		ip := s.allocate(mac)
@@ -116,6 +117,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptRouter(s.router)),
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
+			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
 		)
 		log.Printf("dhcp: ACK %s -> %s", mac, ip)
 	default:
