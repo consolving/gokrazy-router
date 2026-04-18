@@ -16,50 +16,69 @@ import (
 
 // PortInfo describes the link state and traffic counters for a network port.
 type PortInfo struct {
-	Name    string `json:"name"`
-	Up      bool   `json:"up"`
-	Carrier bool   `json:"carrier"`
-	TxBytes uint64 `json:"txBytes"`
-	RxBytes uint64 `json:"rxBytes"`
-	TxPkts  uint64 `json:"txPackets"`
-	RxPkts  uint64 `json:"rxPackets"`
+	Name    string      `json:"name"`
+	Up      bool        `json:"up"`
+	Carrier bool        `json:"carrier"`
+	TxBytes uint64      `json:"txBytes"`
+	RxBytes uint64      `json:"rxBytes"`
+	TxPkts  uint64      `json:"txPackets"`
+	RxPkts  uint64      `json:"rxPackets"`
+	Sub     []PortInfo  `json:"sub,omitempty"` // sub-ports (e.g. lan1-4 under lan)
 }
 
 // ClientInfo describes a connected client with traffic counters.
 type ClientInfo struct {
 	IP      string `json:"ip"`
 	MAC     string `json:"mac"`
-	TxBytes uint64 `json:"txBytes"` // bytes sent TO client (download)
-	RxBytes uint64 `json:"rxBytes"` // bytes sent FROM client (upload)
+	Via     string `json:"via"`      // "L" = LAN, "W" = WiFi
+	TxBytes uint64 `json:"txBytes"`  // bytes sent TO client (download)
+	RxBytes uint64 `json:"rxBytes"`  // bytes sent FROM client (upload)
+	TxPkts  uint64 `json:"txPackets"`
+	RxPkts  uint64 `json:"rxPackets"`
+}
+
+// SummaryInfo provides aggregate TX/RX stats for a category.
+type SummaryInfo struct {
+	Name    string `json:"name"`
+	TxBytes uint64 `json:"txBytes"`
+	RxBytes uint64 `json:"rxBytes"`
 	TxPkts  uint64 `json:"txPackets"`
 	RxPkts  uint64 `json:"rxPackets"`
 }
 
 // Status is the full status response.
 type Status struct {
-	Ports   []PortInfo   `json:"ports"`
-	Clients []ClientInfo `json:"clients"`
+	Summary []SummaryInfo `json:"summary"`
+	Ports   []PortInfo    `json:"ports"`
+	Clients []ClientInfo  `json:"clients"`
 }
 
 // Monitor tracks per-client nftables counter rules and provides status.
 type Monitor struct {
-	mu      sync.Mutex
-	conn    *nftables.Conn
-	table   *nftables.Table
-	chainRx *nftables.Chain // traffic FROM clients (src match)
-	chainTx *nftables.Chain // traffic TO clients (dst match)
-	clients map[string]clientEntry // IP -> entry
-	ports   []string
+	mu        sync.Mutex
+	conn      *nftables.Conn
+	table     *nftables.Table
+	chainRx   *nftables.Chain // traffic FROM clients (src match)
+	chainTx   *nftables.Chain // traffic TO clients (dst match)
+	clients   map[string]clientEntry // IP -> entry
+	wanIface  string
+	lanIface  string   // bridge name (br-lan)
+	lanPorts  []string // individual LAN ports (lan1-lan4)
+	wifiIface string
 }
 
 type clientEntry struct {
-	MAC string
-	IP  net.IP
+	MAC  string
+	IP   net.IP
+	Via  string // "L" or "W"
 }
 
-// New creates a Monitor. ports is the list of interface names to report on
-// (e.g. ["wan", "lan1", "lan2", "lan3", "lan4"]).
-func New(ports []string) (*Monitor, error) {
+// New creates a Monitor.
+// wanIface is the WAN interface (e.g. "wan").
+// lanIface is the LAN bridge (e.g. "br-lan").
+// lanPorts are the individual LAN ports (e.g. ["lan1","lan2","lan3","lan4"]).
+// wifiIface is the WiFi interface (e.g. "wlan0").
+func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monitor, error) {
 	conn := &nftables.Conn{}
 
 	table := conn.AddTable(&nftables.Table{
@@ -89,17 +108,21 @@ func New(ports []string) (*Monitor, error) {
 	}
 
 	return &Monitor{
-		conn:    conn,
-		table:   table,
-		chainRx: chainRx,
-		chainTx: chainTx,
-		clients: make(map[string]clientEntry),
-		ports:   ports,
+		conn:      conn,
+		table:     table,
+		chainRx:   chainRx,
+		chainTx:   chainTx,
+		clients:   make(map[string]clientEntry),
+		wanIface:  wanIface,
+		lanIface:  lanIface,
+		lanPorts:  lanPorts,
+		wifiIface: wifiIface,
 	}, nil
 }
 
 // AddClient adds nftables counter rules for a new DHCP client.
-func (m *Monitor) AddClient(ip net.IP, mac string) error {
+// via is "L" for LAN or "W" for WiFi.
+func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -156,34 +179,56 @@ func (m *Monitor) AddClient(ip net.IP, mac string) error {
 		return fmt.Errorf("status: add counter rules for %s: %w", ipStr, err)
 	}
 
-	m.clients[ipStr] = clientEntry{MAC: mac, IP: ip4}
-	log.Printf("status: tracking %s (%s)", ipStr, mac)
+	m.clients[ipStr] = clientEntry{MAC: mac, IP: ip4, Via: via}
+	log.Printf("status: tracking %s (%s) via %s", ipStr, mac, via)
 	return nil
+}
+
+// getPortInfo returns port info for a single interface.
+func getPortInfo(name string) PortInfo {
+	pi := PortInfo{Name: name}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return pi
+	}
+	attrs := link.Attrs()
+	pi.Up = attrs.Flags&net.FlagUp != 0
+	pi.Carrier = attrs.OperState == netlink.OperUp
+	if stats := attrs.Statistics; stats != nil {
+		pi.TxBytes = stats.TxBytes
+		pi.RxBytes = stats.RxBytes
+		pi.TxPkts = stats.TxPackets
+		pi.RxPkts = stats.RxPackets
+	}
+	return pi
 }
 
 // GetStatus returns the current port and client status.
 func (m *Monitor) GetStatus() (*Status, error) {
 	s := &Status{}
 
-	// Collect port info via netlink.
-	for _, name := range m.ports {
-		pi := PortInfo{Name: name}
-		link, err := netlink.LinkByName(name)
-		if err != nil {
-			pi.Up = false
-			pi.Carrier = false
-		} else {
-			attrs := link.Attrs()
-			pi.Up = attrs.Flags&net.FlagUp != 0
-			pi.Carrier = attrs.OperState == netlink.OperUp
-			if stats := attrs.Statistics; stats != nil {
-				pi.TxBytes = stats.TxBytes
-				pi.RxBytes = stats.RxBytes
-				pi.TxPkts = stats.TxPackets
-				pi.RxPkts = stats.RxPackets
-			}
-		}
-		s.Ports = append(s.Ports, pi)
+	// WAN port
+	wanPort := getPortInfo(m.wanIface)
+	s.Ports = append(s.Ports, wanPort)
+
+	// LAN: bridge with sub-ports
+	lanPort := getPortInfo(m.lanIface)
+	lanPort.Name = "lan"
+	for _, name := range m.lanPorts {
+		lanPort.Sub = append(lanPort.Sub, getPortInfo(name))
+	}
+	s.Ports = append(s.Ports, lanPort)
+
+	// WiFi port
+	wifiPort := getPortInfo(m.wifiIface)
+	wifiPort.Name = "wifi"
+	s.Ports = append(s.Ports, wifiPort)
+
+	// Summary: aggregate TX/RX per category
+	s.Summary = []SummaryInfo{
+		{Name: "wan", TxBytes: wanPort.TxBytes, RxBytes: wanPort.RxBytes, TxPkts: wanPort.TxPkts, RxPkts: wanPort.RxPkts},
+		{Name: "lan", TxBytes: lanPort.TxBytes, RxBytes: lanPort.RxBytes, TxPkts: lanPort.TxPkts, RxPkts: lanPort.RxPkts},
+		{Name: "wifi", TxBytes: wifiPort.TxBytes, RxBytes: wifiPort.RxBytes, TxPkts: wifiPort.TxPkts, RxPkts: wifiPort.RxPkts},
 	}
 
 	// Collect client counters from nftables.
@@ -224,6 +269,7 @@ func (m *Monitor) GetStatus() (*Status, error) {
 		ci := ClientInfo{
 			IP:  ipStr,
 			MAC: entry.MAC,
+			Via: entry.Via,
 		}
 		if rx, ok := rxCounters[ipStr]; ok {
 			ci.RxBytes = rx[0]

@@ -12,18 +12,28 @@ import (
 )
 
 type PortInfo struct {
-	Name    string `json:"name"`
-	Up      bool   `json:"up"`
-	Carrier bool   `json:"carrier"`
+	Name    string     `json:"name"`
+	Up      bool       `json:"up"`
+	Carrier bool       `json:"carrier"`
+	TxBytes uint64     `json:"txBytes"`
+	RxBytes uint64     `json:"rxBytes"`
+	TxPkts  uint64     `json:"txPackets"`
+	RxPkts  uint64     `json:"rxPackets"`
+	Sub     []PortInfo `json:"sub,omitempty"`
+}
+
+type ClientInfo struct {
+	IP      string `json:"ip"`
+	MAC     string `json:"mac"`
+	Via     string `json:"via"`
 	TxBytes uint64 `json:"txBytes"`
 	RxBytes uint64 `json:"rxBytes"`
 	TxPkts  uint64 `json:"txPackets"`
 	RxPkts  uint64 `json:"rxPackets"`
 }
 
-type ClientInfo struct {
-	IP      string `json:"ip"`
-	MAC     string `json:"mac"`
+type SummaryInfo struct {
+	Name    string `json:"name"`
 	TxBytes uint64 `json:"txBytes"`
 	RxBytes uint64 `json:"rxBytes"`
 	TxPkts  uint64 `json:"txPackets"`
@@ -31,8 +41,9 @@ type ClientInfo struct {
 }
 
 type Status struct {
-	Ports   []PortInfo   `json:"ports"`
-	Clients []ClientInfo `json:"clients"`
+	Summary []SummaryInfo `json:"summary"`
+	Ports   []PortInfo    `json:"ports"`
+	Clients []ClientInfo  `json:"clients"`
 }
 
 func main() {
@@ -60,20 +71,26 @@ func main() {
 		return
 	}
 
+	// Summary
+	if len(s.Summary) > 0 {
+		fmt.Println("SUMMARY")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(w, "IFACE\tRX\tTX\tRX PKTS\tTX PKTS\n")
+		for _, si := range s.Summary {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
+				si.Name, humanBytes(si.RxBytes), humanBytes(si.TxBytes),
+				si.RxPkts, si.TxPkts)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
 	// Ports table
 	fmt.Println("PORTS")
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "NAME\tSTATUS\tRX PKTS\tTX PKTS\tRX\tTX\n")
+	fmt.Fprintf(w, "NAME\tSTATUS\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
-		st := "DOWN"
-		if p.Up && p.Carrier {
-			st = "UP"
-		} else if p.Up {
-			st = "NO-LINK"
-		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
-			p.Name, st, p.RxPkts, p.TxPkts,
-			humanBytes(p.RxBytes), humanBytes(p.TxBytes))
+		printPort(w, p, "")
 	}
 	w.Flush()
 
@@ -81,15 +98,36 @@ func main() {
 		fmt.Println()
 		fmt.Println("CLIENTS")
 		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(w, "IP\tMAC\tUL PKTS\tDL PKTS\tUL\tDL\n")
+		fmt.Fprintf(w, "VIA\tIP\tMAC\tUL\tDL\tUL PKTS\tDL PKTS\n")
 		for _, c := range s.Clients {
-			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
-				c.IP, c.MAC, c.RxPkts, c.TxPkts,
-				humanBytes(c.RxBytes), humanBytes(c.TxBytes))
+			via := c.Via
+			if via == "" {
+				via = "?"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
+				via, c.IP, c.MAC,
+				humanBytes(c.RxBytes), humanBytes(c.TxBytes),
+				c.RxPkts, c.TxPkts)
 		}
 		w.Flush()
 	} else {
 		fmt.Println("\nNo clients connected.")
+	}
+}
+
+func printPort(w *tabwriter.Writer, p PortInfo, prefix string) {
+	st := "DOWN"
+	if p.Up && p.Carrier {
+		st = "UP"
+	} else if p.Up {
+		st = "NO-LINK"
+	}
+	fmt.Fprintf(w, "%s%s\t%s\t%s\t%s\t%d\t%d\n",
+		prefix, p.Name, st,
+		humanBytes(p.RxBytes), humanBytes(p.TxBytes),
+		p.RxPkts, p.TxPkts)
+	for _, sub := range p.Sub {
+		printPort(w, sub, "  ")
 	}
 }
 

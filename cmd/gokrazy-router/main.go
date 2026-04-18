@@ -56,13 +56,11 @@ func main() {
 	}
 
 	// 4. Start status monitor (nftables per-client counters).
-	monitorPorts := append([]string{cfg.NAT.OutInterface}, cfg.LAN.Interfaces...)
 	wifiIface := cfg.WiFi.Interface
 	if wifiIface == "" {
 		wifiIface = "wlan0"
 	}
-	monitorPorts = append(monitorPorts, wifiIface)
-	mon, err := status.New(monitorPorts)
+	mon, err := status.New(cfg.NAT.OutInterface, cfg.LAN.Bridge, cfg.LAN.Interfaces, wifiIface)
 	if err != nil {
 		log.Printf("status monitor: %v (continuing without)", err)
 	}
@@ -133,7 +131,7 @@ func main() {
 		// Register lease callback for traffic monitoring.
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
-				if err := mon.AddClient(ip, mac); err != nil {
+				if err := mon.AddClient(ip, mac, "L"); err != nil {
 					log.Printf("status: failed to add client %s: %v", ip, err)
 				}
 			})
@@ -162,7 +160,7 @@ func main() {
 
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
-				if err := mon.AddClient(ip, mac); err != nil {
+				if err := mon.AddClient(ip, mac, "W"); err != nil {
 					log.Printf("status: failed to add WiFi client %s: %v", ip, err)
 				}
 			})
