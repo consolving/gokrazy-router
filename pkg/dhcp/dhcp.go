@@ -74,7 +74,7 @@ func New(iface, serverAddr, rangeStart, rangeEnd string, dns []string, leaseDur 
 // Run starts the DHCP server. It blocks until an error occurs.
 func (s *Server) Run() error {
 	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 67}
-	srv, err := server4.NewServer(s.iface, laddr, s.handler)
+	srv, err := server4.NewServer(s.iface, laddr, s.handler, server4.WithSummaryLogger())
 	if err != nil {
 		return fmt.Errorf("dhcp server: %w", err)
 	}
@@ -83,6 +83,7 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {
+	log.Printf("dhcp: received %s from %s (hw=%s)", req.MessageType(), peer, req.ClientHWAddr)
 	if req.OpCode != dhcpv4.OpcodeBootRequest {
 		return
 	}
