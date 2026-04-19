@@ -80,12 +80,17 @@ func main() {
 			log.Fatalf("wifi: %v", err)
 		}
 
-		// Log WLAN client events.
+		// Log WLAN client events and update status monitor.
 		ap.OnClient(func(ev wifi.ClientEvent) {
 			if ev.Associated {
 				log.Printf("wifi: client %s connected via WLAN", ev.MAC)
 			} else {
 				log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
+				if mon != nil {
+					if err := mon.RemoveClientByMAC(ev.MAC); err != nil {
+						log.Printf("status: failed to remove WiFi client %s: %v", ev.MAC, err)
+					}
+				}
 			}
 		})
 
@@ -135,6 +140,11 @@ func main() {
 					log.Printf("status: failed to add client %s: %v", ip, err)
 				}
 			})
+			srv.OnLeaseExpired(func(ip net.IP, mac string) {
+				if err := mon.RemoveClient(ip); err != nil {
+					log.Printf("status: failed to remove client %s: %v", ip, err)
+				}
+			})
 		}
 
 		go func() {
@@ -162,6 +172,11 @@ func main() {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "W"); err != nil {
 					log.Printf("status: failed to add WiFi client %s: %v", ip, err)
+				}
+			})
+			srv.OnLeaseExpired(func(ip net.IP, mac string) {
+				if err := mon.RemoveClient(ip); err != nil {
+					log.Printf("status: failed to remove WiFi client %s: %v", ip, err)
 				}
 			})
 		}
@@ -196,6 +211,9 @@ func main() {
 	// Cleanup.
 	if wifiAP != nil {
 		wifiAP.Stop()
+	}
+	if mon != nil {
+		mon.Stop()
 	}
 	if natMgr != nil {
 		natMgr.Cleanup()

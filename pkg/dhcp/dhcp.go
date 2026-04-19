@@ -15,6 +15,9 @@ import (
 // LeaseCallback is called when a new client gets a lease.
 type LeaseCallback func(ip net.IP, mac string)
 
+// LeaseExpiredCallback is called when a client's lease expires without renewal.
+type LeaseExpiredCallback func(ip net.IP, mac string)
+
 // Server is a minimal DHCPv4 server that hands out leases from a
 // configured range on a specific interface.
 type Server struct {
@@ -27,10 +30,11 @@ type Server struct {
 	lease     time.Duration
 	router    net.IP
 
-	mu        sync.Mutex
-	leases    map[string]lease // MAC -> lease
-	nextIP    net.IP
-	onLease   LeaseCallback
+	mu             sync.Mutex
+	leases         map[string]lease // MAC -> lease
+	nextIP         net.IP
+	onLease        LeaseCallback
+	onLeaseExpired LeaseExpiredCallback
 }
 
 type lease struct {
@@ -80,6 +84,11 @@ func (s *Server) OnLease(cb LeaseCallback) {
 	s.onLease = cb
 }
 
+// OnLeaseExpired registers a callback for lease expirations.
+func (s *Server) OnLeaseExpired(cb LeaseExpiredCallback) {
+	s.onLeaseExpired = cb
+}
+
 // Run starts the DHCP server. It blocks until an error occurs.
 func (s *Server) Run() error {
 	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 67}
@@ -88,7 +97,47 @@ func (s *Server) Run() error {
 		return fmt.Errorf("dhcp server: %w", err)
 	}
 	log.Printf("dhcp: serving on %s (%s, range %s-%s)", s.iface, s.serverIP, s.rangeStart, s.rangeEnd)
+
+	// Start lease expiry checker.
+	go s.reapExpiredLeases()
+
 	return srv.Serve()
+}
+
+// reapExpiredLeases periodically checks for expired leases and fires callbacks.
+func (s *Server) reapExpiredLeases() {
+	// Check every 1/4 of the lease duration, minimum 30 seconds.
+	interval := s.lease / 4
+	if interval < 30*time.Second {
+		interval = 30 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		var expired []lease
+		var expiredMACs []string
+		for mac, l := range s.leases {
+			if now.After(l.Expires) {
+				expired = append(expired, l)
+				expiredMACs = append(expiredMACs, mac)
+			}
+		}
+		for _, mac := range expiredMACs {
+			delete(s.leases, mac)
+		}
+		s.mu.Unlock()
+
+		if s.onLeaseExpired != nil {
+			for i, l := range expired {
+				log.Printf("dhcp: lease expired for %s (%s)", l.IP, expiredMACs[i])
+				s.onLeaseExpired(dupIP(l.IP), expiredMACs[i])
+			}
+		}
+	}
 }
 
 func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {

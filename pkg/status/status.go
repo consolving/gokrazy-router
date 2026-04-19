@@ -7,7 +7,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -20,6 +24,8 @@ type PortInfo struct {
 	MAC     string      `json:"mac,omitempty"`
 	Up      bool        `json:"up"`
 	Carrier bool        `json:"carrier"`
+	Speed   int         `json:"speed,omitempty"`  // negotiated link speed in Mbps, 0 if unknown
+	Duplex  string      `json:"duplex,omitempty"` // "full", "half", or ""
 	TxBytes uint64      `json:"txBytes"`
 	RxBytes uint64      `json:"rxBytes"`
 	TxPkts  uint64      `json:"txPackets"`
@@ -29,13 +35,30 @@ type PortInfo struct {
 
 // ClientInfo describes a connected client with traffic counters.
 type ClientInfo struct {
-	IP      string `json:"ip"`
-	MAC     string `json:"mac"`
-	Via     string `json:"via"`      // "L" = LAN, "W" = WiFi, "G" = Gateway (router itself)
+	IP        string `json:"ip"`
+	MAC       string `json:"mac"`
+	Via       string `json:"via"`      // "L" = LAN, "W" = WiFi, "G" = Gateway (router itself)
+	Connected bool   `json:"connected"`
+
+	// Live counters: current session only (reset on reconnect).
 	TxBytes uint64 `json:"txBytes"`  // bytes sent TO client (download)
 	RxBytes uint64 `json:"rxBytes"`  // bytes sent FROM client (upload)
 	TxPkts  uint64 `json:"txPackets"`
 	RxPkts  uint64 `json:"rxPackets"`
+
+	// Current throughput in bytes/sec (computed by background sampler).
+	TxRate float64 `json:"txRate"` // download rate (bytes/sec)
+	RxRate float64 `json:"rxRate"` // upload rate (bytes/sec)
+
+	// Historical counters: accumulated across all sessions since boot.
+	TotalTxBytes uint64 `json:"totalTxBytes"`
+	TotalRxBytes uint64 `json:"totalRxBytes"`
+	TotalTxPkts  uint64 `json:"totalTxPackets"`
+	TotalRxPkts  uint64 `json:"totalRxPackets"`
+
+	// Timestamps
+	FirstSeen    string `json:"firstSeen"`
+	LastSeen     string `json:"lastSeen"`
 }
 
 // SummaryInfo provides aggregate TX/RX stats for a category.
@@ -67,12 +90,39 @@ type Monitor struct {
 	lanIface   string   // bridge name (br-lan)
 	lanPorts   []string // individual LAN ports (lan1-lan4)
 	wifiIface  string
+
+	// Throughput sampling state.
+	prevSnapshot map[string]counterSnapshot // IP -> previous sample
+	rates        map[string]clientRate      // IP -> computed rates
+	stopCh       chan struct{}
+}
+
+// counterSnapshot stores a point-in-time counter reading for rate calculation.
+type counterSnapshot struct {
+	RxBytes uint64
+	TxBytes uint64
+	Time    time.Time
+}
+
+// clientRate stores the computed throughput for a client.
+type clientRate struct {
+	RxRate float64 // upload bytes/sec
+	TxRate float64 // download bytes/sec
 }
 
 type clientEntry struct {
-	MAC  string
-	IP   net.IP
-	Via  string // "L" or "W"
+	MAC       string
+	IP        net.IP
+	Via       string // "L" or "W"
+	Connected bool
+	FirstSeen time.Time
+	LastSeen  time.Time
+
+	// Historical counters accumulated from previous sessions.
+	HistTxBytes uint64
+	HistRxBytes uint64
+	HistTxPkts  uint64
+	HistRxPkts  uint64
 }
 
 // New creates a Monitor.
@@ -125,18 +175,25 @@ func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monit
 		}
 	}
 
-	return &Monitor{
-		conn:       conn,
-		table:      table,
-		chainRx:    chainRx,
-		chainTx:    chainTx,
-		clients:    make(map[string]clientEntry),
-		gatewayIPs: gwIPs,
-		wanIface:   wanIface,
-		lanIface:   lanIface,
-		lanPorts:   lanPorts,
-		wifiIface:  wifiIface,
-	}, nil
+	m := &Monitor{
+		conn:         conn,
+		table:        table,
+		chainRx:      chainRx,
+		chainTx:      chainTx,
+		clients:      make(map[string]clientEntry),
+		gatewayIPs:   gwIPs,
+		wanIface:     wanIface,
+		lanIface:     lanIface,
+		lanPorts:     lanPorts,
+		wifiIface:    wifiIface,
+		prevSnapshot: make(map[string]counterSnapshot),
+		rates:        make(map[string]clientRate),
+		stopCh:       make(chan struct{}),
+	}
+
+	go m.sampleLoop()
+
+	return m, nil
 }
 
 // AddClient adds nftables counter rules for a new DHCP client.
@@ -146,13 +203,35 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	defer m.mu.Unlock()
 
 	ipStr := ip.To4().String()
-	if _, exists := m.clients[ipStr]; exists {
-		return nil // already tracked
-	}
 
 	// Mark router's own IPs as gateway.
 	if m.gatewayIPs[ipStr] {
 		via = "G"
+	}
+
+	now := time.Now()
+
+	// If client already exists and is connected, nothing to do.
+	if entry, exists := m.clients[ipStr]; exists {
+		if entry.Connected {
+			return nil
+		}
+		// Client is reconnecting: keep historical counters, re-add nftables rules.
+		entry.Connected = true
+		entry.LastSeen = now
+		entry.MAC = mac // MAC may have changed (different device, same IP)
+		entry.Via = via
+		m.clients[ipStr] = entry
+		// Fall through to add fresh nftables counter rules.
+	} else {
+		m.clients[ipStr] = clientEntry{
+			MAC:       mac,
+			IP:        ip.To4(),
+			Via:       via,
+			Connected: true,
+			FirstSeen: now,
+			LastSeen:  now,
+		}
 	}
 
 	ip4 := ip.To4()
@@ -203,9 +282,188 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 		return fmt.Errorf("status: add counter rules for %s: %w", ipStr, err)
 	}
 
-	m.clients[ipStr] = clientEntry{MAC: mac, IP: ip4, Via: via}
 	log.Printf("status: tracking %s (%s) via %s", ipStr, mac, via)
 	return nil
+}
+
+// RemoveClient marks a client as disconnected. The current nftables counter
+// values are read and accumulated into the historical totals, then the
+// nftables rules are deleted so that a future reconnect starts fresh counters.
+func (m *Monitor) RemoveClient(ip net.IP) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ipStr := ip.To4().String()
+	entry, exists := m.clients[ipStr]
+	if !exists {
+		return nil // unknown client, nothing to do
+	}
+	if !entry.Connected {
+		return nil // already disconnected
+	}
+
+	// Read current counters before deleting rules.
+	rxBytes, rxPkts := m.readAndDeleteRules(m.chainRx, ipStr+"/rx")
+	txBytes, txPkts := m.readAndDeleteRules(m.chainTx, ipStr+"/tx")
+
+	// Accumulate into historical totals.
+	entry.HistRxBytes += rxBytes
+	entry.HistRxPkts += rxPkts
+	entry.HistTxBytes += txBytes
+	entry.HistTxPkts += txPkts
+	entry.Connected = false
+	entry.LastSeen = time.Now()
+	m.clients[ipStr] = entry
+
+	if err := m.conn.Flush(); err != nil {
+		return fmt.Errorf("status: flush after removing rules for %s: %w", ipStr, err)
+	}
+
+	log.Printf("status: client %s (%s) disconnected (session: rx=%d tx=%d bytes)",
+		ipStr, entry.MAC, rxBytes, txBytes)
+	return nil
+}
+
+// RemoveClientByMAC marks a client as disconnected by MAC address.
+// This is useful for WiFi disconnect events where only the MAC is known.
+func (m *Monitor) RemoveClientByMAC(mac string) error {
+	m.mu.Lock()
+	var ip net.IP
+	for _, entry := range m.clients {
+		if entry.MAC == mac && entry.Connected {
+			ip = entry.IP
+			break
+		}
+	}
+	m.mu.Unlock()
+
+	if ip == nil {
+		return nil // unknown MAC
+	}
+	return m.RemoveClient(ip)
+}
+
+// readAndDeleteRules reads the counter values from nftables rules matching
+// the given userData tag, deletes them, and returns the total bytes and packets.
+// Must be called with m.mu held.
+func (m *Monitor) readAndDeleteRules(chain *nftables.Chain, tag string) (bytes, packets uint64) {
+	rules, err := m.conn.GetRules(m.table, chain)
+	if err != nil {
+		log.Printf("status: failed to get rules for chain %s: %v", chain.Name, err)
+		return 0, 0
+	}
+	for _, r := range rules {
+		if string(r.UserData) != tag {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				bytes += c.Bytes
+				packets += c.Packets
+			}
+		}
+		if err := m.conn.DelRule(r); err != nil {
+			log.Printf("status: failed to delete rule %s: %v", tag, err)
+		}
+	}
+	return bytes, packets
+}
+
+const sampleInterval = 5 * time.Second
+
+// sampleLoop periodically reads nftables counters and computes per-client throughput.
+func (m *Monitor) sampleLoop() {
+	ticker := time.NewTicker(sampleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.sample()
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+// sample reads the current nftables counters and computes rates from the delta
+// since the last sample.
+func (m *Monitor) sample() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+
+	rxRules, _ := m.conn.GetRules(m.table, m.chainRx)
+	txRules, _ := m.conn.GetRules(m.table, m.chainTx)
+
+	// Build current snapshot.
+	current := make(map[string]counterSnapshot)
+	for _, r := range rxRules {
+		ip := extractIP(r.UserData, "/rx")
+		if ip == "" {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				snap := current[ip]
+				snap.RxBytes = c.Bytes
+				snap.Time = now
+				current[ip] = snap
+			}
+		}
+	}
+	for _, r := range txRules {
+		ip := extractIP(r.UserData, "/tx")
+		if ip == "" {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				snap := current[ip]
+				snap.TxBytes = c.Bytes
+				snap.Time = now
+				current[ip] = snap
+			}
+		}
+	}
+
+	// Compute rates by comparing to previous snapshot.
+	newRates := make(map[string]clientRate)
+	for ip, cur := range current {
+		prev, ok := m.prevSnapshot[ip]
+		if !ok {
+			// First sample for this client — no rate yet.
+			continue
+		}
+		dt := cur.Time.Sub(prev.Time).Seconds()
+		if dt <= 0 {
+			continue
+		}
+		var rxDelta, txDelta uint64
+		if cur.RxBytes >= prev.RxBytes {
+			rxDelta = cur.RxBytes - prev.RxBytes
+		}
+		if cur.TxBytes >= prev.TxBytes {
+			txDelta = cur.TxBytes - prev.TxBytes
+		}
+		newRates[ip] = clientRate{
+			RxRate: float64(rxDelta) / dt,
+			TxRate: float64(txDelta) / dt,
+		}
+	}
+
+	m.prevSnapshot = current
+	m.rates = newRates
+}
+
+// Stop shuts down the background sampler.
+func (m *Monitor) Stop() {
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
 }
 
 // getPortInfo returns port info for a single interface.
@@ -227,7 +485,38 @@ func getPortInfo(name string) PortInfo {
 		pi.TxPkts = stats.TxPackets
 		pi.RxPkts = stats.RxPackets
 	}
+
+	// Read negotiated link speed and duplex from sysfs.
+	pi.Speed = readSysfsInt(fmt.Sprintf("/sys/class/net/%s/speed", name))
+	pi.Duplex = readSysfsString(fmt.Sprintf("/sys/class/net/%s/duplex", name))
+
 	return pi
+}
+
+// readSysfsInt reads a single integer from a sysfs file. Returns 0 on error.
+func readSysfsInt(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || v < 0 {
+		return 0 // kernel returns -1 for unknown speed
+	}
+	return v
+}
+
+// readSysfsString reads a trimmed string from a sysfs file. Returns "" on error.
+func readSysfsString(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "unknown" {
+		return ""
+	}
+	return s
 }
 
 // GetStatus returns the current port and client status.
@@ -294,18 +583,42 @@ func (m *Monitor) GetStatus() (*Status, error) {
 
 	for ipStr, entry := range m.clients {
 		ci := ClientInfo{
-			IP:  ipStr,
-			MAC: entry.MAC,
-			Via: entry.Via,
+			IP:        ipStr,
+			MAC:       entry.MAC,
+			Via:       entry.Via,
+			Connected: entry.Connected,
+			FirstSeen: entry.FirstSeen.Format(time.RFC3339),
+			LastSeen:  entry.LastSeen.Format(time.RFC3339),
 		}
+
+		// Live counters from nftables (only present if connected).
+		var liveRxBytes, liveRxPkts, liveTxBytes, liveTxPkts uint64
 		if rx, ok := rxCounters[ipStr]; ok {
-			ci.RxBytes = rx[0]
-			ci.RxPkts = rx[1]
+			liveRxBytes = rx[0]
+			liveRxPkts = rx[1]
 		}
 		if tx, ok := txCounters[ipStr]; ok {
-			ci.TxBytes = tx[0]
-			ci.TxPkts = tx[1]
+			liveTxBytes = tx[0]
+			liveTxPkts = tx[1]
 		}
+
+		ci.RxBytes = liveRxBytes
+		ci.RxPkts = liveRxPkts
+		ci.TxBytes = liveTxBytes
+		ci.TxPkts = liveTxPkts
+
+		// Throughput from background sampler.
+		if rate, ok := m.rates[ipStr]; ok {
+			ci.RxRate = rate.RxRate
+			ci.TxRate = rate.TxRate
+		}
+
+		// Historical = accumulated from past sessions + current live session.
+		ci.TotalRxBytes = entry.HistRxBytes + liveRxBytes
+		ci.TotalRxPkts = entry.HistRxPkts + liveRxPkts
+		ci.TotalTxBytes = entry.HistTxBytes + liveTxBytes
+		ci.TotalTxPkts = entry.HistTxPkts + liveTxPkts
+
 		s.Clients = append(s.Clients, ci)
 	}
 

@@ -16,6 +16,8 @@ type PortInfo struct {
 	MAC     string     `json:"mac,omitempty"`
 	Up      bool       `json:"up"`
 	Carrier bool       `json:"carrier"`
+	Speed   int        `json:"speed,omitempty"`
+	Duplex  string     `json:"duplex,omitempty"`
 	TxBytes uint64     `json:"txBytes"`
 	RxBytes uint64     `json:"rxBytes"`
 	TxPkts  uint64     `json:"txPackets"`
@@ -24,13 +26,22 @@ type PortInfo struct {
 }
 
 type ClientInfo struct {
-	IP      string `json:"ip"`
-	MAC     string `json:"mac"`
-	Via     string `json:"via"`
-	TxBytes uint64 `json:"txBytes"`
-	RxBytes uint64 `json:"rxBytes"`
-	TxPkts  uint64 `json:"txPackets"`
-	RxPkts  uint64 `json:"rxPackets"`
+	IP           string  `json:"ip"`
+	MAC          string  `json:"mac"`
+	Via          string  `json:"via"`
+	Connected    bool    `json:"connected"`
+	TxBytes      uint64  `json:"txBytes"`
+	RxBytes      uint64  `json:"rxBytes"`
+	TxPkts       uint64  `json:"txPackets"`
+	RxPkts       uint64  `json:"rxPackets"`
+	TxRate       float64 `json:"txRate"`
+	RxRate       float64 `json:"rxRate"`
+	TotalTxBytes uint64  `json:"totalTxBytes"`
+	TotalRxBytes uint64  `json:"totalRxBytes"`
+	TotalTxPkts  uint64  `json:"totalTxPackets"`
+	TotalRxPkts  uint64  `json:"totalRxPackets"`
+	FirstSeen    string  `json:"firstSeen"`
+	LastSeen     string  `json:"lastSeen"`
 }
 
 type SummaryInfo struct {
@@ -74,52 +85,83 @@ func main() {
 
 	// Ports table (wan, lan1-4, wifi)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "IFACE\tMAC\tRX\tTX\tRX PKTS\tTX PKTS\n")
+	fmt.Fprintf(w, "IFACE\tMAC\tSPEED\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
 		if len(p.Sub) > 0 {
 			// Show sub-ports directly (e.g. lan1-lan4 instead of lan)
 			for _, sub := range p.Sub {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n",
-					sub.Name, sub.MAC, humanBytes(sub.RxBytes), humanBytes(sub.TxBytes),
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
+					sub.Name, sub.MAC, formatSpeed(sub.Speed, sub.Duplex),
+					humanBytes(sub.RxBytes), humanBytes(sub.TxBytes),
 					sub.RxPkts, sub.TxPkts)
 			}
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\n",
-				p.Name, p.MAC, humanBytes(p.RxBytes), humanBytes(p.TxBytes),
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
+				p.Name, p.MAC, formatSpeed(p.Speed, p.Duplex),
+				humanBytes(p.RxBytes), humanBytes(p.TxBytes),
 				p.RxPkts, p.TxPkts)
 		}
 	}
 	w.Flush()
 
 	if len(s.Clients) > 0 {
-		fmt.Println()
-		fmt.Println("CLIENTS")
-		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(w, "VIA\tIP\tMAC\tUL\tDL\tUL PKTS\tDL PKTS\n")
-		hasLAN := false
-		hasWiFi := false
+		// Separate connected and disconnected clients.
+		var connected, disconnected []ClientInfo
 		for _, c := range s.Clients {
-			via := c.Via
-			switch via {
-			case "L":
-				hasLAN = true
-			case "W":
-				hasWiFi = true
-			case "":
-				via = "?"
+			if c.Connected {
+				connected = append(connected, c)
+			} else {
+				disconnected = append(disconnected, c)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
-				via, c.IP, c.MAC,
-				humanBytes(c.RxBytes), humanBytes(c.TxBytes),
-				c.RxPkts, c.TxPkts)
 		}
-		w.Flush()
 
-		if hasLAN && hasWiFi {
+		fmt.Println()
+		fmt.Println("CONNECTED CLIENTS")
+		if len(connected) == 0 {
+			fmt.Println("  (none)")
+		} else {
+			w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintf(w, "VIA\tIP\tMAC\tUL RATE\tDL RATE\tUL\tDL\tTOTAL UL\tTOTAL DL\n")
+			hasWiFi := false
+			for _, c := range connected {
+				via := c.Via
+				if via == "W" {
+					hasWiFi = true
+				} else if via == "" {
+					via = "?"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					via, c.IP, c.MAC,
+					humanRate(c.RxRate), humanRate(c.TxRate),
+					humanBytes(c.RxBytes), humanBytes(c.TxBytes),
+					humanBytes(c.TotalRxBytes), humanBytes(c.TotalTxBytes))
+			}
+			w.Flush()
+
+			if hasWiFi {
+				fmt.Println()
+				fmt.Println("NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi")
+				fmt.Println("      clients can reach each other — no inter-subnet firewall")
+				fmt.Println("      rules are configured.")
+			}
+		}
+
+		if len(disconnected) > 0 {
 			fmt.Println()
-			fmt.Println("NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi")
-			fmt.Println("      clients can reach each other — no inter-subnet firewall")
-			fmt.Println("      rules are configured.")
+			fmt.Println("DISCONNECTED CLIENTS (historical)")
+			w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintf(w, "VIA\tIP\tMAC\tTOTAL UL\tTOTAL DL\tLAST SEEN\n")
+			for _, c := range disconnected {
+				via := c.Via
+				if via == "" {
+					via = "?"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+					via, c.IP, c.MAC,
+					humanBytes(c.TotalRxBytes), humanBytes(c.TotalTxBytes),
+					c.LastSeen)
+			}
+			w.Flush()
 		}
 	} else {
 		fmt.Println("\nNo clients connected.")
@@ -136,5 +178,32 @@ func humanBytes(b uint64) string {
 		return fmt.Sprintf("%.1f KiB", float64(b)/float64(1<<10))
 	default:
 		return fmt.Sprintf("%d B", b)
+	}
+}
+
+func formatSpeed(speed int, duplex string) string {
+	if speed <= 0 {
+		return "-"
+	}
+	s := fmt.Sprintf("%d Mbps", speed)
+	if duplex != "" {
+		s += "/" + duplex
+	}
+	return s
+}
+
+func humanRate(bytesPerSec float64) string {
+	if bytesPerSec < 1 {
+		return "0 B/s"
+	}
+	switch {
+	case bytesPerSec >= 1<<30:
+		return fmt.Sprintf("%.1f GiB/s", bytesPerSec/float64(1<<30))
+	case bytesPerSec >= 1<<20:
+		return fmt.Sprintf("%.1f MiB/s", bytesPerSec/float64(1<<20))
+	case bytesPerSec >= 1<<10:
+		return fmt.Sprintf("%.1f KiB/s", bytesPerSec/float64(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSec)
 	}
 }
