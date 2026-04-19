@@ -8,7 +8,8 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **DHCP server** — Serves leases on `br-lan` (and optionally on a separate WiFi subnet)
 - **NAT/masquerade** — nftables-based masquerade for outbound traffic via `wan`
 - **WiFi access point** — Runs the onboard RTL8192CU as an AP via a bundled `hostapd` binary, with automatic restart on crash (exponential backoff)
-- **Per-client traffic monitoring** — nftables counters exposed via an HTTP status API on `:8080`
+- **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
+- **Port speed detection** — Reads negotiated link speed and duplex from sysfs
 - **Status CLI** — `gokrazy-router-status` queries the API and prints port/client tables
 
 ## Hardware
@@ -114,6 +115,34 @@ Use the CLI tool to query it:
 gokrazy-router-status --host 10.0.0.1
 gokrazy-router-status --host 10.0.0.1 --json
 ```
+
+Example output:
+
+```
+IFACE  MAC                SPEED           RX         TX       RX PKTS  TX PKTS
+wan    a2:b4:c6:d8:e0:12  100 Mbps/full   8.2 MiB    1.6 MiB  11764    7190
+lan1   a2:b4:c6:d8:e0:12  -               0 B        0 B      0        0
+lan2   a2:b4:c6:d8:e0:12  -               0 B        0 B      0        0
+lan3   a2:b4:c6:d8:e0:12  -               0 B        0 B      0        0
+lan4   a2:b4:c6:d8:e0:12  1000 Mbps/full  190.7 KiB  3.4 MiB  1516     2759
+wifi   f0:e1:d2:c3:b4:a5  -               1.2 MiB    4.5 MiB  5443     5879
+
+CONNECTED CLIENTS
+VIA  IP          MAC                UL RATE    DL RATE    UL         DL       TOTAL UL   TOTAL DL
+L    10.0.0.100  00:11:22:33:44:55  1.3 KiB/s  3.4 KiB/s  156.4 KiB  3.3 MiB  156.4 KiB  3.3 MiB
+W    10.0.1.100  66:77:88:99:aa:bb  0 B/s      0 B/s      556.9 KiB  2.1 MiB  556.9 KiB  2.1 MiB
+W    10.0.1.101  cc:dd:ee:ff:00:11  0 B/s      0 B/s      601.5 KiB  2.2 MiB  601.5 KiB  2.2 MiB
+
+NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi
+      clients can reach each other — no inter-subnet firewall
+      rules are configured.
+```
+
+The columns show:
+- **UL RATE / DL RATE** — Current throughput (sampled every 5 seconds)
+- **UL / DL** — Current session traffic (reset on reconnect)
+- **TOTAL UL / TOTAL DL** — Accumulated traffic across all sessions since boot
+- **SPEED** — Negotiated port link speed and duplex
 
 ## Dependencies
 
