@@ -16,6 +16,7 @@ type Manager struct {
 	conn     *nftables.Conn
 	table    *nftables.Table
 	chain    *nftables.Chain
+	fwdChain *nftables.Chain // forward chain for isolation rules (created on demand)
 	outIface string
 }
 
@@ -145,6 +146,58 @@ func (m *Manager) AddSource(srcNet *net.IPNet) error {
 	}
 
 	log.Printf("nat: added masquerade for %s/%d via %s", srcNet.IP, ones, m.outIface)
+	return nil
+}
+
+// AddIsolation adds forward-chain rules that drop traffic from an isolated
+// VLAN bridge to any other VLAN bridge. Traffic to the WAN (outIface) is
+// still allowed because the forward chain has a default policy of accept
+// and we only drop inter-bridge forwarding.
+//
+// The rule matches: iifname == isolatedBridge AND oifname == otherBridge → drop.
+func (m *Manager) AddIsolation(isolatedBridge string, otherBridges []string) error {
+	// Ensure we have a forward chain in the same table.
+	if m.fwdChain == nil {
+		m.fwdChain = m.conn.AddChain(&nftables.Chain{
+			Name:     "forward",
+			Table:    m.table,
+			Type:     nftables.ChainTypeFilter,
+			Hooknum:  nftables.ChainHookForward,
+			Priority: nftables.ChainPriorityFilter,
+		})
+	}
+
+	for _, other := range otherBridges {
+		// Drop: isolatedBridge -> otherBridge
+		m.conn.AddRule(&nftables.Rule{
+			Table: m.table,
+			Chain: m.fwdChain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(isolatedBridge)},
+				&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(other)},
+				&expr.Verdict{Kind: expr.VerdictDrop},
+			},
+		})
+		// Drop: otherBridge -> isolatedBridge
+		m.conn.AddRule(&nftables.Rule{
+			Table: m.table,
+			Chain: m.fwdChain,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(other)},
+				&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(isolatedBridge)},
+				&expr.Verdict{Kind: expr.VerdictDrop},
+			},
+		})
+		log.Printf("nat: isolation: drop %s <-> %s", isolatedBridge, other)
+	}
+
+	if err := m.conn.Flush(); err != nil {
+		return fmt.Errorf("nftables flush isolation rules: %w", err)
+	}
 	return nil
 }
 

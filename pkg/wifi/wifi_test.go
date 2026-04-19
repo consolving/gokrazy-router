@@ -61,7 +61,11 @@ func TestNewDefaults(t *testing.T) {
 func TestConfTemplate(t *testing.T) {
 	data := struct {
 		config.WiFiConfig
-		Bridge string
+		Bridge        string
+		DynamicVLAN   bool
+		VLANFile      string
+		AcceptMACFile string
+		VLANBridge    string
 	}{
 		WiFiConfig: config.WiFiConfig{
 			Interface:   "wlan0",
@@ -95,12 +99,20 @@ func TestConfTemplate(t *testing.T) {
 			t.Errorf("config missing %q", want)
 		}
 	}
+	// Should NOT contain dynamic VLAN directives.
+	if strings.Contains(out, "dynamic_vlan") {
+		t.Error("config should not contain dynamic_vlan when DynamicVLAN=false")
+	}
 }
 
 func TestConfTemplateNoBridge(t *testing.T) {
 	data := struct {
 		config.WiFiConfig
-		Bridge string
+		Bridge        string
+		DynamicVLAN   bool
+		VLANFile      string
+		AcceptMACFile string
+		VLANBridge    string
 	}{
 		WiFiConfig: config.WiFiConfig{
 			Interface:  "wlan0",
@@ -118,6 +130,47 @@ func TestConfTemplateNoBridge(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "bridge=") {
 		t.Error("config should not contain bridge= in routed mode")
+	}
+}
+
+func TestConfTemplateDynamicVLAN(t *testing.T) {
+	data := struct {
+		config.WiFiConfig
+		Bridge        string
+		DynamicVLAN   bool
+		VLANFile      string
+		AcceptMACFile string
+		VLANBridge    string
+	}{
+		WiFiConfig: config.WiFiConfig{
+			Interface:  "wlan0",
+			SSID:       "Test",
+			Passphrase: "12345678",
+			HWMode:     "g",
+			Channel:    6,
+			WPA:        2,
+		},
+		DynamicVLAN:   true,
+		VLANFile:      "/tmp/hostapd.vlan",
+		AcceptMACFile: "/tmp/hostapd.accept",
+		VLANBridge:    "br-vlan",
+	}
+
+	var buf bytes.Buffer
+	if err := confTemplate.Execute(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"dynamic_vlan=1",
+		"vlan_file=/tmp/hostapd.vlan",
+		"accept_mac_file=/tmp/hostapd.accept",
+		"vlan_bridge=br-vlan",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config missing %q:\n%s", want, out)
+		}
 	}
 }
 

@@ -1,5 +1,8 @@
 // Command gokrazy-router-status queries the router's status API and displays
 // port link states and per-client traffic counters.
+//
+// It can also export the list of known MAC addresses as a TOML file for
+// VLAN assignment, and merge new clients into an existing mapping file.
 package main
 
 import (
@@ -9,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"text/tabwriter"
+
+	"github.com/consolving/gokrazy-router/pkg/macmap"
 )
 
 type PortInfo struct {
@@ -64,6 +69,8 @@ type Status struct {
 func main() {
 	host := flag.String("host", "10.0.0.1:8080", "router status API address")
 	jsonOut := flag.Bool("json", false, "output raw JSON")
+	exportTOML := flag.Bool("export-toml", false, "export known MACs as TOML mac-vlan-map")
+	mergeFile := flag.String("merge", "", "merge new MACs into existing TOML file (use with --export-toml)")
 	flag.Parse()
 
 	resp, err := http.Get(fmt.Sprintf("http://%s/status", *host))
@@ -77,6 +84,11 @@ func main() {
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		fmt.Fprintf(os.Stderr, "error decoding response: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *exportTOML {
+		exportMACMap(s, *mergeFile)
+		return
 	}
 
 	if *jsonOut {
@@ -231,4 +243,55 @@ func formatSignal(dBm int) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d dBm", dBm)
+}
+
+// exportMACMap builds a TOML mac-vlan-map from the status API's client list.
+// If mergeFile is set, it loads the existing file and adds only new MACs.
+func exportMACMap(s Status, mergeFile string) {
+	// Build a MapFile from the current status.
+	current := &macmap.MapFile{}
+	for _, c := range s.Clients {
+		if c.MAC == "" {
+			continue
+		}
+		client := macmap.Client{
+			MAC:  c.MAC,
+			VLAN: 0, // unassigned
+		}
+		// Use IP as a hint in the name field.
+		if c.IP != "" {
+			via := c.Via
+			if via == "W" {
+				via = "wifi"
+			} else if via == "L" {
+				via = "lan"
+			}
+			client.Name = fmt.Sprintf("%s (%s)", c.IP, via)
+		}
+		current.Clients = append(current.Clients, client)
+	}
+
+	if mergeFile != "" {
+		// Load existing file, merge new MACs into it.
+		existing, err := macmap.Load(mergeFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error loading %s: %v\n", mergeFile, err)
+			os.Exit(1)
+		}
+		existing.Merge(current)
+		current = existing
+	} else {
+		// Fresh export -- set a sensible default.
+		current.DefaultVLAN = 1
+		fmt.Fprintln(os.Stderr, "# Exported MAC addresses from router status API.")
+		fmt.Fprintln(os.Stderr, "# Edit VLAN assignments, then deploy to the router.")
+		fmt.Fprintln(os.Stderr, "# Use --merge to add new clients to an existing file.")
+	}
+
+	data, err := current.Encode()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error encoding TOML: %v\n", err)
+		os.Exit(1)
+	}
+	os.Stdout.Write(data)
 }

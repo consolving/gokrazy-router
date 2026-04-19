@@ -16,6 +16,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
 	"github.com/consolving/gokrazy-router/pkg/status"
+	"github.com/consolving/gokrazy-router/pkg/vlan"
 	"github.com/consolving/gokrazy-router/pkg/wifi"
 	"github.com/vishvananda/netlink"
 )
@@ -33,10 +34,24 @@ func main() {
 		cfg = config.Default()
 	}
 
-	// 1. Create bridge, enslave LAN ports, assign IP.
-	_, err = netsetup.Setup(cfg.LAN.Bridge, cfg.LAN.Interfaces, cfg.LAN.Address)
-	if err != nil {
-		log.Fatalf("netsetup: %v", err)
+	// 1. Network setup: either VLAN mode or flat bridge mode.
+	vlanMode := len(cfg.VLANs) > 0
+	var vlanBridges []vlan.VLANBridge
+
+	if vlanMode {
+		// VLAN mode: create per-VLAN bridges with DSA port membership.
+		log.Printf("vlan: configuring %d VLANs", len(cfg.VLANs))
+		vlanBridges, err = vlan.Setup(cfg.VLANs)
+		if err != nil {
+			log.Fatalf("vlan: %v", err)
+		}
+		_ = vlanBridges // used below for inter-VLAN isolation
+	} else {
+		// Flat mode: single bridge for all LAN ports.
+		_, err = netsetup.Setup(cfg.LAN.Bridge, cfg.LAN.Interfaces, cfg.LAN.Address)
+		if err != nil {
+			log.Fatalf("netsetup: %v", err)
+		}
 	}
 
 	// 2. Enable IP forwarding.
@@ -47,13 +62,65 @@ func main() {
 	// 3. Install NAT masquerade rules.
 	var natMgr *nat.Manager
 	if cfg.NAT.Enabled {
-		_, srcNet, err := net.ParseCIDR(cfg.LAN.Address)
-		if err != nil {
-			log.Fatalf("parse LAN CIDR: %v", err)
+		if vlanMode {
+			// In VLAN mode, set up NAT for each VLAN that has nat=true.
+			var initialized bool
+			for _, vc := range cfg.VLANs {
+				if !vc.NAT {
+					continue
+				}
+				_, vNet, _ := net.ParseCIDR(vc.Address)
+				if vNet == nil {
+					continue
+				}
+				if !initialized {
+					natMgr, err = nat.Setup(cfg.NAT.OutInterface, vNet)
+					if err != nil {
+						log.Fatalf("nat: %v", err)
+					}
+					initialized = true
+				} else {
+					if err := natMgr.AddSource(vNet); err != nil {
+						log.Fatalf("nat: add VLAN %d source: %v", vc.ID, err)
+					}
+				}
+			}
+		} else {
+			_, srcNet, err := net.ParseCIDR(cfg.LAN.Address)
+			if err != nil {
+				log.Fatalf("parse LAN CIDR: %v", err)
+			}
+			natMgr, err = nat.Setup(cfg.NAT.OutInterface, srcNet)
+			if err != nil {
+				log.Fatalf("nat: %v", err)
+			}
 		}
-		natMgr, err = nat.Setup(cfg.NAT.OutInterface, srcNet)
-		if err != nil {
-			log.Fatalf("nat: %v", err)
+	}
+
+	// 3b. Install inter-VLAN isolation rules for isolated VLANs.
+	if vlanMode && natMgr != nil {
+		// Collect all VLAN bridge names.
+		var allBridges []string
+		for _, vc := range cfg.VLANs {
+			allBridges = append(allBridges, vlan.BridgeName(vc.ID))
+		}
+		for _, vc := range cfg.VLANs {
+			if !vc.Isolated {
+				continue
+			}
+			isolated := vlan.BridgeName(vc.ID)
+			var others []string
+			for _, b := range allBridges {
+				if b != isolated {
+					others = append(others, b)
+				}
+			}
+			if len(others) > 0 {
+				if err := natMgr.AddIsolation(isolated, others); err != nil {
+					log.Fatalf("nat: isolation for VLAN %d: %v", vc.ID, err)
+				}
+				log.Printf("vlan: VLAN %d (%s) isolated from %d other VLANs", vc.ID, vc.Name, len(others))
+			}
 		}
 	}
 
@@ -78,10 +145,21 @@ func main() {
 		} else {
 			log.Printf("wifi: %s is available", wifiIface)
 
-			// Determine bridge parameter: if WiFi has its own address (routed mode),
-			// don't pass bridge to hostapd. Otherwise, bridge into LAN bridge.
+			// Determine bridge parameter for hostapd.
+			// In VLAN mode with macMap: bridge wlan0 into the default VLAN bridge
+			// so unmatched clients land there. Matched clients get VLAN sub-interfaces
+			// bridged via hostapd's vlan_bridge directive.
+			// In flat mode with explicit bridge: use that bridge.
+			// In routed mode (address set, no macMap): no bridge.
 			wifiBridge := ""
-			if cfg.WiFi.Bridge != "" && cfg.WiFi.Address == "" {
+			if vlanMode && cfg.WiFi.MacMapFile != "" {
+				defaultVLAN := cfg.WiFi.DefaultVLAN
+				if defaultVLAN == 0 {
+					defaultVLAN = 1
+				}
+				wifiBridge = vlan.BridgeName(defaultVLAN)
+				log.Printf("wifi: VLAN mode, bridging wlan0 into %s (default VLAN %d)", wifiBridge, defaultVLAN)
+			} else if cfg.WiFi.Bridge != "" && cfg.WiFi.Address == "" {
 				wifiBridge = cfg.WiFi.Bridge
 			}
 
@@ -115,7 +193,8 @@ func main() {
 			}
 
 			// Routed mode: assign IP to wlan0, add NAT for WiFi subnet.
-			if cfg.WiFi.Address != "" {
+			// Skip in VLAN mode — WiFi clients get IPs from per-VLAN DHCP servers.
+			if cfg.WiFi.Address != "" && wifiAP.MacMap() == nil {
 				if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
 					log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
 				}
@@ -135,8 +214,51 @@ func main() {
 		}
 	}
 
-	// 6. Start DHCP server on LAN bridge.
-	if cfg.LAN.DHCP.Enabled {
+	// 6. Start DHCP servers.
+	if vlanMode {
+		// Start a DHCP server on each VLAN bridge that has DHCP enabled.
+		for _, vc := range cfg.VLANs {
+			if !vc.DHCP.Enabled {
+				continue
+			}
+			bridgeName := vlan.BridgeName(vc.ID)
+			srv, err := dhcp.New(
+				bridgeName,
+				vc.Address,
+				vc.DHCP.RangeStart,
+				vc.DHCP.RangeEnd,
+				vc.DHCP.DNS,
+				vc.DHCP.ParseLeaseDuration(),
+			)
+			if err != nil {
+				log.Fatalf("dhcp vlan %d: %v", vc.ID, err)
+			}
+			if mon != nil {
+				vlanName := vc.Name
+				if vlanName == "" {
+					vlanName = fmt.Sprintf("vlan%d", vc.ID)
+				}
+				via := fmt.Sprintf("V%d", vc.ID)
+				srv.OnLease(func(ip net.IP, mac string) {
+					if err := mon.AddClient(ip, mac, via); err != nil {
+						log.Printf("status: failed to add %s client %s: %v", vlanName, ip, err)
+					}
+				})
+				srv.OnLeaseExpired(func(ip net.IP, mac string) {
+					if err := mon.RemoveClient(ip); err != nil {
+						log.Printf("status: failed to remove %s client %s: %v", vlanName, ip, err)
+					}
+				})
+			}
+			go func(id int) {
+				if err := srv.Run(); err != nil {
+					log.Fatalf("dhcp server (VLAN %d): %v", id, err)
+				}
+			}(vc.ID)
+			log.Printf("dhcp: started on %s for VLAN %d (%s)", bridgeName, vc.ID, vc.Name)
+		}
+	} else if cfg.LAN.DHCP.Enabled {
+		// Flat mode: single DHCP server on the LAN bridge.
 		srv, err := dhcp.New(
 			cfg.LAN.Bridge,
 			cfg.LAN.Address,
@@ -170,8 +292,8 @@ func main() {
 		}()
 	}
 
-	// 7. Start DHCP server on WiFi interface (routed mode only).
-	if wifiAP != nil && cfg.WiFi.Address != "" && cfg.WiFi.DHCP.Enabled {
+	// 7. Start DHCP server on WiFi interface (routed mode only, not in VLAN mode).
+	if wifiAP != nil && cfg.WiFi.Address != "" && cfg.WiFi.DHCP.Enabled && wifiAP.MacMap() == nil {
 		srv, err := dhcp.New(
 			wifiIface,
 			cfg.WiFi.Address,
@@ -252,6 +374,16 @@ func assignIP(ifaceName, cidr string) error {
 		}
 	}
 	return netlink.LinkSetUp(link)
+}
+
+// enableProxyARP enables proxy ARP on the named interface via sysctl.
+// This allows the router to answer ARP requests on behalf of hosts
+// reachable via a different interface on the same subnet.
+func enableProxyARP(ifaceName string) {
+	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", ifaceName)
+	if err := os.WriteFile(path, []byte("1"), 0644); err != nil {
+		log.Printf("proxy_arp: failed to enable on %s: %v", ifaceName, err)
+	}
 }
 
 // waitForInterface polls until the named network interface exists.

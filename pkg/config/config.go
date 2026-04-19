@@ -35,12 +35,13 @@ type DHCPConfig struct {
 }
 
 type VLANConfig struct {
-	ID      int        `json:"id"`
-	Name    string     `json:"name"`
-	Ports   []string   `json:"ports"`
-	Address string     `json:"address"`
-	DHCP    DHCPConfig `json:"dhcp"`
-	NAT     bool       `json:"nat"`
+	ID       int        `json:"id"`
+	Name     string     `json:"name"`
+	Ports    []string   `json:"ports"`
+	Address  string     `json:"address"`
+	DHCP     DHCPConfig `json:"dhcp"`
+	NAT      bool       `json:"nat"`
+	Isolated bool       `json:"isolated,omitempty"` // if true, block inter-VLAN traffic (internet-only)
 }
 
 type NATConfig struct {
@@ -51,9 +52,11 @@ type NATConfig struct {
 type WiFiConfig struct {
 	Enabled     bool       `json:"enabled"`
 	Interface   string     `json:"interface"`
-	Bridge      string     `json:"bridge"`      // if empty, wlan0 gets its own subnet (recommended for rtl8xxxu)
+	Bridge      string     `json:"bridge"`      // if empty, wlan0 gets its own subnet
 	Address     string     `json:"address"`      // CIDR for wlan0 when not bridged, e.g. "10.0.1.1/24"
 	DHCP        DHCPConfig `json:"dhcp"`         // DHCP pool for WiFi clients (when not bridged)
+	MacMapFile  string     `json:"macMapFile"`   // path to MAC-to-VLAN TOML mapping file
+	DefaultVLAN int        `json:"defaultVlan"`  // VLAN for WiFi clients not in the map (0 = use macmap default)
 	SSID        string     `json:"ssid"`
 	Passphrase  string     `json:"passphrase"`
 	Channel     int        `json:"channel"`

@@ -25,11 +25,14 @@ import (
 	"time"
 
 	"github.com/consolving/gokrazy-router/pkg/config"
+	"github.com/consolving/gokrazy-router/pkg/macmap"
 )
 
 const (
-	confPath    = "/tmp/hostapd.conf"
-	hostapdPath = "/usr/local/bin/hostapd"
+	confPath       = "/tmp/hostapd.conf"
+	acceptMACPath  = "/tmp/hostapd.accept"
+	vlanFilePath   = "/tmp/hostapd.vlan"
+	hostapdPath    = "/usr/local/bin/hostapd"
 )
 
 // ClientEvent describes a WiFi client association or disassociation.
@@ -53,6 +56,7 @@ const (
 type AP struct {
 	cfg      config.WiFiConfig
 	bridge   string // empty = routed mode
+	macMap   *macmap.MapFile
 	cmd      *exec.Cmd
 	onClient ClientCallback
 
@@ -90,6 +94,16 @@ wpa={{.WPA}}
 wpa_passphrase={{.Passphrase}}
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
+{{- if .DynamicVLAN}}
+
+# Dynamic VLAN assignment based on MAC address
+dynamic_vlan=1
+vlan_file={{.VLANFile}}
+accept_mac_file={{.AcceptMACFile}}
+{{- if .VLANBridge}}
+vlan_bridge={{.VLANBridge}}
+{{- end}}
+{{- end}}
 
 # Logging: enable all module messages to stdout
 logger_stdout=-1
@@ -122,9 +136,22 @@ func New(cfg config.WiFiConfig, bridge string) (*AP, error) {
 		cfg.WPA = 2
 	}
 
+	// Load MAC-to-VLAN mapping if configured.
+	var mm *macmap.MapFile
+	if cfg.MacMapFile != "" {
+		var err error
+		mm, err = macmap.Load(cfg.MacMapFile)
+		if err != nil {
+			return nil, fmt.Errorf("wifi: load mac map: %w", err)
+		}
+		log.Printf("wifi: loaded MAC map from %s (%d clients, default vlan %d)",
+			cfg.MacMapFile, len(mm.Clients), mm.DefaultVLAN)
+	}
+
 	return &AP{
 		cfg:     cfg,
 		bridge:  bridge,
+		macMap:  mm,
 		clients: make(map[string]bool),
 		stopCh:  make(chan struct{}),
 	}, nil
@@ -153,14 +180,37 @@ func (ap *AP) Start() error {
 	return nil
 }
 
-// writeConfig generates the hostapd.conf file.
+// writeConfig generates the hostapd.conf file and optional VLAN/MAC files.
 func (ap *AP) writeConfig() error {
+	dynamicVLAN := ap.macMap != nil
+
+	// Write VLAN and accept MAC files if dynamic VLAN is enabled.
+	if dynamicVLAN {
+		if err := ap.writeVLANFile(); err != nil {
+			return err
+		}
+		if err := ap.writeAcceptMACFile(); err != nil {
+			return err
+		}
+	}
+
 	data := struct {
 		config.WiFiConfig
-		Bridge string
+		Bridge        string
+		DynamicVLAN   bool
+		VLANFile      string
+		AcceptMACFile string
+		VLANBridge    string
 	}{
-		WiFiConfig: ap.cfg,
-		Bridge:     ap.bridge,
+		WiFiConfig:    ap.cfg,
+		Bridge:        ap.bridge,
+		DynamicVLAN:   dynamicVLAN,
+		VLANFile:      vlanFilePath,
+		AcceptMACFile: acceptMACPath,
+		// vlan_bridge is a prefix: hostapd creates br<prefix><vid>.
+		// We use "br-vlan" so it creates "br-vlan10", "br-vlan20", etc.
+		// matching our VLAN bridge names.
+		VLANBridge: "br-vlan",
 	}
 
 	f, err := os.Create(confPath)
@@ -177,8 +227,46 @@ func (ap *AP) writeConfig() error {
 	if ap.bridge != "" {
 		mode = "bridged (" + ap.bridge + ")"
 	}
+	if dynamicVLAN {
+		mode += " + dynamic-vlan"
+	}
 	log.Printf("wifi: wrote %s (ssid=%s iface=%s channel=%d mode=%s)", confPath, ap.cfg.SSID, ap.cfg.Interface, ap.cfg.Channel, mode)
 	return nil
+}
+
+// writeVLANFile generates the hostapd vlan_file mapping VLAN IDs to
+// interface names. Format: "<vlan_id> <iface_name>"
+// hostapd will create these interfaces when clients are assigned to VLANs.
+func (ap *AP) writeVLANFile() error {
+	var b strings.Builder
+	for _, vid := range ap.macMap.VLANs() {
+		if vid == 0 {
+			continue
+		}
+		// hostapd creates vlan sub-interfaces named <iface>.<vid>
+		fmt.Fprintf(&b, "%d %s.%d\n", vid, ap.cfg.Interface, vid)
+	}
+	if err := os.WriteFile(vlanFilePath, []byte(b.String()), 0644); err != nil {
+		return fmt.Errorf("wifi: write vlan file: %w", err)
+	}
+	log.Printf("wifi: wrote %s (%d VLANs)", vlanFilePath, len(ap.macMap.VLANs()))
+	return nil
+}
+
+// writeAcceptMACFile generates the hostapd accept_mac_file mapping MAC
+// addresses to VLAN IDs. Format: "<mac> <vlan_id>"
+func (ap *AP) writeAcceptMACFile() error {
+	content := ap.macMap.HostapdAcceptMACFile()
+	if err := os.WriteFile(acceptMACPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("wifi: write accept mac file: %w", err)
+	}
+	log.Printf("wifi: wrote %s (%d entries)", acceptMACPath, len(ap.macMap.Clients))
+	return nil
+}
+
+// MacMap returns the loaded MAC-to-VLAN mapping, or nil if not configured.
+func (ap *AP) MacMap() *macmap.MapFile {
+	return ap.macMap
 }
 
 // launch starts a new hostapd process.
