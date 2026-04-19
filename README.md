@@ -65,7 +65,7 @@ All settings are driven by a JSON file (default `/etc/gokrazy-router.json`). If 
 
 ### WiFi modes
 
-- **Routed** (default): `wlan0` gets its own subnet. A separate DHCP server runs on `wlan0`. Works with all drivers including `rtl8xxxu`.
+- **Routed** (default): `wlan0` gets its own subnet. A separate DHCP server runs on `wlan0`.
 - **Bridged**: Set `"bridge": "br-lan"` in the wifi config. `wlan0` is added to the LAN bridge. Requires driver support for AP+bridge.
 
 ## Deployment
@@ -128,10 +128,10 @@ lan4   a2:b4:c6:d8:e0:12  1000 Mbps/full  190.7 KiB  3.4 MiB  1516     2759
 wifi   f0:e1:d2:c3:b4:a5  -               1.2 MiB    4.5 MiB  5443     5879
 
 CONNECTED CLIENTS
-VIA  IP          MAC                UL RATE    DL RATE    UL         DL       TOTAL UL   TOTAL DL
-L    10.0.0.100  00:11:22:33:44:55  1.3 KiB/s  3.4 KiB/s  156.4 KiB  3.3 MiB  156.4 KiB  3.3 MiB
-W    10.0.1.100  66:77:88:99:aa:bb  0 B/s      0 B/s      556.9 KiB  2.1 MiB  556.9 KiB  2.1 MiB
-W    10.0.1.101  cc:dd:ee:ff:00:11  0 B/s      0 B/s      601.5 KiB  2.2 MiB  601.5 KiB  2.2 MiB
+VIA  IP          MAC                UL RATE    DL RATE    LINK       SIGNAL   UL         DL       TOTAL UL   TOTAL DL
+L    10.0.0.100  00:11:22:33:44:55  1.3 KiB/s  3.4 KiB/s  -          -        156.4 KiB  3.3 MiB  156.4 KiB  3.3 MiB
+W    10.0.1.100  66:77:88:99:aa:bb  0 B/s      0 B/s      -          -25 dBm  556.9 KiB  2.1 MiB  556.9 KiB  2.1 MiB
+W    10.0.1.101  cc:dd:ee:ff:00:11  0 B/s      0 B/s      -          -42 dBm  601.5 KiB  2.2 MiB  601.5 KiB  2.2 MiB
 
 NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi
       clients can reach each other — no inter-subnet firewall
@@ -140,6 +140,8 @@ NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi
 
 The columns show:
 - **UL RATE / DL RATE** — Current throughput (sampled every 5 seconds)
+- **LINK** — WiFi link rate (from hostapd control socket)
+- **SIGNAL** — WiFi signal strength in dBm (from hostapd control socket)
 - **UL / DL** — Current session traffic (reset on reconnect)
 - **TOTAL UL / TOTAL DL** — Accumulated traffic across all sessions since boot
 - **SPEED** — Negotiated port link speed and duplex
