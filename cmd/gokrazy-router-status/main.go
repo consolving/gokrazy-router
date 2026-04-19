@@ -96,9 +96,16 @@ func main() {
 		fmt.Println("CLIENTS")
 		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintf(w, "VIA\tIP\tMAC\tUL\tDL\tUL PKTS\tDL PKTS\n")
+		hasLAN := false
+		hasWiFi := false
 		for _, c := range s.Clients {
 			via := c.Via
-			if via == "" {
+			switch via {
+			case "L":
+				hasLAN = true
+			case "W":
+				hasWiFi = true
+			case "":
 				via = "?"
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
@@ -107,6 +114,13 @@ func main() {
 				c.RxPkts, c.TxPkts)
 		}
 		w.Flush()
+
+		if hasLAN && hasWiFi {
+			fmt.Println()
+			fmt.Println("NOTE: WiFi is in routed mode (separate subnet). LAN and WiFi")
+			fmt.Println("      clients can reach each other — no inter-subnet firewall")
+			fmt.Println("      rules are configured.")
+		}
 	} else {
 		fmt.Println("\nNo clients connected.")
 	}
