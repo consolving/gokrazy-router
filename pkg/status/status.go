@@ -50,6 +50,11 @@ type ClientInfo struct {
 	TxRate float64 `json:"txRate"` // download rate (bytes/sec)
 	RxRate float64 `json:"rxRate"` // upload rate (bytes/sec)
 
+	// WiFi link info (only for WiFi clients, from hostapd control socket).
+	LinkTxRate int `json:"linkTxRate,omitempty"` // TX link rate in Kbps
+	LinkRxRate int `json:"linkRxRate,omitempty"` // RX link rate in Kbps
+	Signal     int `json:"signal,omitempty"`     // last RSSI in dBm
+
 	// Historical counters: accumulated across all sessions since boot.
 	TotalTxBytes uint64 `json:"totalTxBytes"`
 	TotalRxBytes uint64 `json:"totalRxBytes"`
@@ -77,6 +82,20 @@ type Status struct {
 	Clients []ClientInfo  `json:"clients"`
 }
 
+// WiFiStationSource provides per-station WiFi info.
+type WiFiStationSource interface {
+	// StationInfoAll returns info for all connected WiFi stations.
+	StationInfoAll() ([]WiFiStation, error)
+}
+
+// WiFiStation holds WiFi station data as returned by a WiFiStationSource.
+type WiFiStation struct {
+	MAC       string
+	Signal    int // dBm
+	TxBitrate int // Kbps
+	RxBitrate int // Kbps
+}
+
 // Monitor tracks per-client nftables counter rules and provides status.
 type Monitor struct {
 	mu         sync.Mutex
@@ -95,6 +114,10 @@ type Monitor struct {
 	prevSnapshot map[string]counterSnapshot // IP -> previous sample
 	rates        map[string]clientRate      // IP -> computed rates
 	stopCh       chan struct{}
+
+	// WiFi station info (MAC -> info).
+	wifiStations map[string]wifiStationInfo
+	wifiSource   WiFiStationSource
 }
 
 // counterSnapshot stores a point-in-time counter reading for rate calculation.
@@ -108,6 +131,13 @@ type counterSnapshot struct {
 type clientRate struct {
 	RxRate float64 // upload bytes/sec
 	TxRate float64 // download bytes/sec
+}
+
+// wifiStationInfo stores per-station data from hostapd control socket.
+type wifiStationInfo struct {
+	LinkTxRate int // Kbps
+	LinkRxRate int // Kbps
+	Signal     int // dBm
 }
 
 type clientEntry struct {
@@ -188,6 +218,7 @@ func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monit
 		wifiIface:    wifiIface,
 		prevSnapshot: make(map[string]counterSnapshot),
 		rates:        make(map[string]clientRate),
+		wifiStations: make(map[string]wifiStationInfo),
 		stopCh:       make(chan struct{}),
 	}
 
@@ -380,6 +411,7 @@ func (m *Monitor) sampleLoop() {
 		select {
 		case <-ticker.C:
 			m.sample()
+			m.pollWiFiStations()
 		case <-m.stopCh:
 			return
 		}
@@ -455,6 +487,47 @@ func (m *Monitor) sample() {
 
 	m.prevSnapshot = current
 	m.rates = newRates
+}
+
+// pollWiFiStations queries the configured WiFiStationSource for per-station info.
+func (m *Monitor) pollWiFiStations() {
+	m.mu.Lock()
+	src := m.wifiSource
+	m.mu.Unlock()
+
+	if src == nil {
+		return
+	}
+
+	stations, err := src.StationInfoAll()
+	if err != nil {
+		log.Printf("status: wifi station poll: %v", err)
+		return
+	}
+	if stations == nil {
+		return
+	}
+
+	info := make(map[string]wifiStationInfo, len(stations))
+	for _, sta := range stations {
+		info[sta.MAC] = wifiStationInfo{
+			LinkTxRate: sta.TxBitrate,
+			LinkRxRate: sta.RxBitrate,
+			Signal:     sta.Signal,
+		}
+	}
+
+	m.mu.Lock()
+	m.wifiStations = info
+	m.mu.Unlock()
+}
+
+// SetWiFiSource sets the source for WiFi station info polling.
+// Must be called before the sample loop needs it (ideally right after New).
+func (m *Monitor) SetWiFiSource(src WiFiStationSource) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.wifiSource = src
 }
 
 // Stop shuts down the background sampler.
@@ -611,6 +684,15 @@ func (m *Monitor) GetStatus() (*Status, error) {
 		if rate, ok := m.rates[ipStr]; ok {
 			ci.RxRate = rate.RxRate
 			ci.TxRate = rate.TxRate
+		}
+
+		// WiFi link info from hostapd control socket (matched by MAC).
+		if entry.Via == "W" {
+			if wsi, ok := m.wifiStations[entry.MAC]; ok {
+				ci.LinkTxRate = wsi.LinkTxRate
+				ci.LinkRxRate = wsi.LinkRxRate
+				ci.Signal = wsi.Signal
+			}
 		}
 
 		// Historical = accumulated from past sessions + current live session.

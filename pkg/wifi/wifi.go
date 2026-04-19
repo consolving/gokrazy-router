@@ -69,6 +69,7 @@ interface={{.Interface}}
 bridge={{.Bridge}}
 {{- end}}
 driver=nl80211
+ctrl_interface=/var/run/hostapd
 ssid={{.SSID}}
 hw_mode={{.HWMode}}
 channel={{.Channel}}
@@ -271,6 +272,18 @@ func (ap *AP) Stop() {
 		log.Printf("wifi: stopping hostapd")
 		ap.cmd.Process.Signal(os.Interrupt)
 	}
+}
+
+// StationInfoAll queries hostapd via its control socket for per-station
+// signal/bitrate info. Returns nil (no error) if the control socket is
+// not available (e.g. hostapd not running yet).
+func (ap *AP) StationInfoAll() ([]StationInfo, error) {
+	ctrl, err := NewCtrlClient(ap.cfg.Interface)
+	if err != nil {
+		return nil, nil // control socket not ready
+	}
+	defer ctrl.Close()
+	return ctrl.Stations()
 }
 
 // Clients returns the list of currently associated client MACs.

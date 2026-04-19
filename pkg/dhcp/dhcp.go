@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
+	"golang.org/x/sys/unix"
 )
 
 // LeaseCallback is called when a new client gets a lease.
@@ -91,8 +93,19 @@ func (s *Server) OnLeaseExpired(cb LeaseExpiredCallback) {
 
 // Run starts the DHCP server. It blocks until an error occurs.
 func (s *Server) Run() error {
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 67}
-	srv, err := server4.NewServer(s.iface, laddr, s.handler, server4.WithSummaryLogger())
+	// Create a UDP socket bound exclusively to our interface.
+	// We intentionally avoid SO_REUSEPORT (which the library's default
+	// NewIPv4UDPConn enables) because with multiple DHCP servers on
+	// different interfaces, SO_REUSEPORT causes the kernel to
+	// load-balance broadcast packets across sockets, delivering
+	// requests to the wrong server.
+	conn, err := newDHCPConn(s.iface)
+	if err != nil {
+		return fmt.Errorf("dhcp server: %w", err)
+	}
+	srv, err := server4.NewServer(s.iface, nil, s.handler,
+		server4.WithSummaryLogger(),
+		server4.WithConn(conn))
 	if err != nil {
 		return fmt.Errorf("dhcp server: %w", err)
 	}
@@ -102,6 +115,37 @@ func (s *Server) Run() error {
 	go s.reapExpiredLeases()
 
 	return srv.Serve()
+}
+
+// newDHCPConn creates a UDP socket on port 67 bound to the given interface,
+// with SO_BROADCAST and SO_REUSEADDR but without SO_REUSEPORT.
+func newDHCPConn(iface string) (*net.UDPConn, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "dhcp-"+iface)
+	defer f.Close()
+
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
+		return nil, fmt.Errorf("SO_BROADCAST: %w", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		return nil, fmt.Errorf("SO_REUSEADDR: %w", err)
+	}
+	// Bind to interface so we only receive packets from this interface.
+	if err := unix.BindToDevice(fd, iface); err != nil {
+		return nil, fmt.Errorf("SO_BINDTODEVICE(%s): %w", iface, err)
+	}
+	sa := unix.SockaddrInet4{Port: 67}
+	if err := unix.Bind(fd, &sa); err != nil {
+		return nil, fmt.Errorf("bind :67: %w", err)
+	}
+	conn, err := net.FilePacketConn(f)
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
 }
 
 // reapExpiredLeases periodically checks for expired leases and fires callbacks.

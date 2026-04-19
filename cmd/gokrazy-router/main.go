@@ -2,12 +2,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/consolving/gokrazy-router/pkg/config"
 	"github.com/consolving/gokrazy-router/pkg/dhcp"
@@ -68,52 +70,66 @@ func main() {
 	// 5. Start WiFi AP (hostapd).
 	var wifiAP *wifi.AP
 	if cfg.WiFi.Enabled {
-		// Determine bridge parameter: if WiFi has its own address (routed mode),
-		// don't pass bridge to hostapd. Otherwise, bridge into LAN bridge.
-		wifiBridge := ""
-		if cfg.WiFi.Bridge != "" && cfg.WiFi.Address == "" {
-			wifiBridge = cfg.WiFi.Bridge
-		}
+		// Wait for the WiFi interface to appear (kernel module may still be loading).
+		log.Printf("wifi: waiting for %s to appear...", wifiIface)
 
-		ap, err := wifi.New(cfg.WiFi, wifiBridge)
-		if err != nil {
-			log.Fatalf("wifi: %v", err)
-		}
+		if err := waitForInterface(wifiIface, 120*time.Second); err != nil {
+			log.Printf("wifi: %v — continuing without WiFi", err)
+		} else {
+			log.Printf("wifi: %s is available", wifiIface)
 
-		// Log WLAN client events and update status monitor.
-		ap.OnClient(func(ev wifi.ClientEvent) {
-			if ev.Associated {
-				log.Printf("wifi: client %s connected via WLAN", ev.MAC)
-			} else {
-				log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
-				if mon != nil {
-					if err := mon.RemoveClientByMAC(ev.MAC); err != nil {
-						log.Printf("status: failed to remove WiFi client %s: %v", ev.MAC, err)
+			// Determine bridge parameter: if WiFi has its own address (routed mode),
+			// don't pass bridge to hostapd. Otherwise, bridge into LAN bridge.
+			wifiBridge := ""
+			if cfg.WiFi.Bridge != "" && cfg.WiFi.Address == "" {
+				wifiBridge = cfg.WiFi.Bridge
+			}
+
+			ap, err := wifi.New(cfg.WiFi, wifiBridge)
+			if err != nil {
+				log.Fatalf("wifi: %v", err)
+			}
+
+			// Log WLAN client events and update status monitor.
+			ap.OnClient(func(ev wifi.ClientEvent) {
+				if ev.Associated {
+					log.Printf("wifi: client %s connected via WLAN", ev.MAC)
+				} else {
+					log.Printf("wifi: client %s disconnected from WLAN", ev.MAC)
+					if mon != nil {
+						if err := mon.RemoveClientByMAC(ev.MAC); err != nil {
+							log.Printf("status: failed to remove WiFi client %s: %v", ev.MAC, err)
+						}
 					}
 				}
+			})
+
+			if err := ap.Start(); err != nil {
+				log.Fatalf("wifi: start: %v", err)
 			}
-		})
+			wifiAP = ap
 
-		if err := ap.Start(); err != nil {
-			log.Fatalf("wifi: start: %v", err)
-		}
-		wifiAP = ap
-
-		// Routed mode: assign IP to wlan0, add NAT for WiFi subnet.
-		if cfg.WiFi.Address != "" {
-			if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
-				log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
+			// Wire WiFi station info into status monitor via hostapd control socket.
+			if mon != nil {
+				mon.SetWiFiSource(&wifiStationAdapter{ap: ap})
 			}
-			log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
 
-			// Add WiFi subnet to NAT masquerade.
-			if natMgr != nil {
-				_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
-				if err != nil {
-					log.Fatalf("parse WiFi CIDR: %v", err)
+			// Routed mode: assign IP to wlan0, add NAT for WiFi subnet.
+			if cfg.WiFi.Address != "" {
+				if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
+					log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
 				}
-				if err := natMgr.AddSource(wifiNet); err != nil {
-					log.Fatalf("nat: add WiFi source: %v", err)
+				log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
+
+				// Add WiFi subnet to NAT masquerade.
+				if natMgr != nil {
+					_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
+					if err != nil {
+						log.Fatalf("parse WiFi CIDR: %v", err)
+					}
+					if err := natMgr.AddSource(wifiNet); err != nil {
+						log.Fatalf("nat: add WiFi source: %v", err)
+					}
 				}
 			}
 		}
@@ -155,7 +171,7 @@ func main() {
 	}
 
 	// 7. Start DHCP server on WiFi interface (routed mode only).
-	if cfg.WiFi.Enabled && cfg.WiFi.Address != "" && cfg.WiFi.DHCP.Enabled {
+	if wifiAP != nil && cfg.WiFi.Address != "" && cfg.WiFi.DHCP.Enabled {
 		srv, err := dhcp.New(
 			wifiIface,
 			cfg.WiFi.Address,
@@ -236,4 +252,38 @@ func assignIP(ifaceName, cidr string) error {
 		}
 	}
 	return netlink.LinkSetUp(link)
+}
+
+// waitForInterface polls until the named network interface exists.
+func waitForInterface(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := netlink.LinkByName(name); err == nil {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("interface %s did not appear within %v", name, timeout)
+}
+
+// wifiStationAdapter adapts wifi.AP to status.WiFiStationSource.
+type wifiStationAdapter struct {
+	ap *wifi.AP
+}
+
+func (a *wifiStationAdapter) StationInfoAll() ([]status.WiFiStation, error) {
+	stations, err := a.ap.StationInfoAll()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]status.WiFiStation, len(stations))
+	for i, s := range stations {
+		result[i] = status.WiFiStation{
+			MAC:       s.MAC,
+			Signal:    s.Signal,
+			TxBitrate: s.TxBitrate,
+			RxBitrate: s.RxBitrate,
+		}
+	}
+	return result, nil
 }

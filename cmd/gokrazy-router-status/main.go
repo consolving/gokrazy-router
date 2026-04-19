@@ -36,6 +36,9 @@ type ClientInfo struct {
 	RxPkts       uint64  `json:"rxPackets"`
 	TxRate       float64 `json:"txRate"`
 	RxRate       float64 `json:"rxRate"`
+	LinkTxRate   int     `json:"linkTxRate,omitempty"`
+	LinkRxRate   int     `json:"linkRxRate,omitempty"`
+	Signal       int     `json:"signal,omitempty"`
 	TotalTxBytes uint64  `json:"totalTxBytes"`
 	TotalRxBytes uint64  `json:"totalRxBytes"`
 	TotalTxPkts  uint64  `json:"totalTxPackets"`
@@ -121,7 +124,7 @@ func main() {
 			fmt.Println("  (none)")
 		} else {
 			w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintf(w, "VIA\tIP\tMAC\tUL RATE\tDL RATE\tUL\tDL\tTOTAL UL\tTOTAL DL\n")
+			fmt.Fprintf(w, "VIA\tIP\tMAC\tUL RATE\tDL RATE\tLINK\tSIGNAL\tUL\tDL\tTOTAL UL\tTOTAL DL\n")
 			hasWiFi := false
 			for _, c := range connected {
 				via := c.Via
@@ -130,9 +133,11 @@ func main() {
 				} else if via == "" {
 					via = "?"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					via, c.IP, c.MAC,
 					humanRate(c.RxRate), humanRate(c.TxRate),
+					formatLinkRate(c.LinkTxRate, c.LinkRxRate),
+					formatSignal(c.Signal),
 					humanBytes(c.RxBytes), humanBytes(c.TxBytes),
 					humanBytes(c.TotalRxBytes), humanBytes(c.TotalTxBytes))
 			}
@@ -206,4 +211,24 @@ func humanRate(bytesPerSec float64) string {
 	default:
 		return fmt.Sprintf("%.0f B/s", bytesPerSec)
 	}
+}
+
+func formatLinkRate(txKbps, rxKbps int) string {
+	if txKbps <= 0 && rxKbps <= 0 {
+		return "-"
+	}
+	// Link rates from hostapd are in Kbps, display in Mbps.
+	tx := float64(txKbps) / 1000
+	rx := float64(rxKbps) / 1000
+	if tx == rx {
+		return fmt.Sprintf("%.1f Mbps", tx)
+	}
+	return fmt.Sprintf("%.1f/%.1f Mbps", tx, rx)
+}
+
+func formatSignal(dBm int) string {
+	if dBm == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d dBm", dBm)
 }

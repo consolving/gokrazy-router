@@ -9,14 +9,14 @@ require (
 )
 
 require (
-	github.com/google/go-cmp v0.6.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
-	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
-	github.com/mdlayher/socket v0.5.0 // indirect
+	github.com/mdlayher/netlink v1.8.0 // indirect
+	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
 	github.com/u-root/uio v0.0.0-20230220225925-ffce2a382923 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
-	golang.org/x/net v0.38.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.6.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
