@@ -53,6 +53,24 @@ BananaPi R1 with a Broadcom BCM53125 5-port Gigabit switch. The Linux kernel's `
 
 All settings are driven by a JSON file (default `/etc/gokrazy-router.json`). If no config is provided, a flat bridge mode with sensible defaults is used.
 
+### Configuration files
+
+The router uses up to three configuration files:
+
+| File | Format | Location on router | Purpose |
+|------|--------|-------------------|---------|
+| Router config | JSON | `/etc/gokrazy-router.json` | Main config: WAN, LAN, VLANs, NAT, WiFi, netboot |
+| MAC map | TOML | Path set in `wifi.macMapFile` (e.g. `/etc/gokrazy-router-macmap.toml`) | MAC-to-VLAN assignment, static IP reservations, per-client netboot images |
+| Boot artifacts | Directory | Path set in `netboot.dir` (e.g. `/data/netboot/`) | Kernels, initrds, iPXE scripts, pxelinux configs |
+
+On a gokrazy device, the JSON config and MAC map are deployed via `ExtraFileContents` in the gokrazy instance config. Boot artifacts are uploaded at runtime via the HTTP API (see [Netboot Image Management API](#netboot-image-management-api)) or placed on persistent storage mounted at `/data/`.
+
+Example files are provided in the [`netboot/`](netboot/) directory:
+- `gokrazy-router.json` — Full router config with netboot enabled on VLAN 1
+- `macmap.toml` — MAC mapping with static IPs and netboot image assignments
+- `boot.ipxe` — Example iPXE boot script
+- `pxelinux.cfg.default` — Example pxelinux config for legacy PXE
+
 ### VLAN mode
 
 ```json
@@ -268,6 +286,8 @@ Add to your gokrazy instance config:
 ```
 
 The `hostapd` and `smbd` binaries must be statically compiled for ARMv7. Use `build-hostapd.sh` and/or `build-samba.sh` to cross-compile them via Docker. Omit the Samba binaries if you do not enable SMB.
+
+See [`netboot/gokrazy-router.json`](netboot/gokrazy-router.json) for a complete config example.
 
 ## Building locally
 
