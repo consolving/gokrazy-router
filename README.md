@@ -11,6 +11,7 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **WiFi access point** — Runs the onboard RTL8192CU as an AP via a bundled `hostapd` binary, with automatic restart on crash (exponential backoff)
 - **WiFi + LAN shared subnet** — WiFi and a LAN port can share a subnet (split into two /25 ranges), with the router forwarding between them
 - **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
+- **Netboot service** — Per-VLAN PXE (TFTP) and HTTP boot server. DHCP automatically injects boot options for legacy PXE, iPXE, and UEFI HTTP Boot clients. Serve kernels, initrds, and boot scripts from a configurable boot directory.
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
 - **Status CLI** — `gokrazy-router-status` queries the API and prints port/client tables
 
@@ -119,6 +120,96 @@ When the `vlans` array is empty or omitted, all LAN ports are bridged into a sin
 - **Routed** (default): `wlan0` gets its own subnet. A separate DHCP server runs on `wlan0`. The RTL8192CU does not support bridged AP mode (data frames are not forwarded), so routed mode is required.
 - **Shared subnet with LAN**: Split a /24 into two /25 subnets — one for WiFi, one for a LAN port. The router forwards between them. See VLAN 31 in the example above.
 
+## Netboot
+
+The router can serve as a PXE/HTTP boot server, configurable per-VLAN. When enabled on a VLAN, the DHCP server automatically injects the appropriate boot options based on client type:
+
+- **Legacy PXE** (BIOS) — DHCP options 66/67 point to the TFTP server and boot filename (e.g. `pxelinux.0`)
+- **iPXE** — Detected via option 175; receives an HTTP URL to an iPXE script instead of a TFTP path
+- **UEFI HTTP Boot** — Detected via client architecture (option 93); receives the HTTP boot URL directly
+
+### Boot artifacts
+
+Place boot files in a per-VLAN directory:
+
+```
+/data/netboot/
+├── trusted/          # matches VLAN name
+│   ├── pxelinux.0
+│   ├── ldlinux.c32
+│   ├── pxelinux.cfg/
+│   │   └── default
+│   ├── vmlinuz
+│   ├── initrd.img
+│   └── boot.ipxe
+└── default/          # fallback for VLANs without a dedicated directory
+    └── ...
+```
+
+### Configuration
+
+Add a `netboot` block to each VLAN that should serve boot images, plus a global `netboot` section:
+
+```json
+{
+  "vlans": [
+    {
+      "id": 1, "name": "trusted", "ports": ["lan1"],
+      "address": "10.0.1.1/24",
+      "dhcp": {"enabled": true, "rangeStart": "10.0.1.100", "rangeEnd": "10.0.1.250", "dns": ["1.1.1.1"]},
+      "nat": true,
+      "netboot": {
+        "enabled": true,
+        "tftp": true,
+        "http": true,
+        "bootDir": "/data/netboot/trusted",
+        "defaultBoot": "pxelinux.0",
+        "ipxeScript": "boot.ipxe"
+      }
+    }
+  ],
+  "netboot": {
+    "dir": "/data/netboot",
+    "httpPort": ":8069"
+  }
+}
+```
+
+- **TFTP** runs on UDP `:69` (standard PXE port)
+- **HTTP boot** runs on the configured `httpPort` (default `:8069`)
+- VLANs without `"netboot": {"enabled": true}` are unaffected — their DHCP responses contain no boot options
+
+### MAC-to-IP and netboot image mapping
+
+The MAC mapping file (TOML) supports static IP reservations and per-client netboot image selection:
+
+```toml
+default_vlan = 30
+
+[[clients]]
+mac = "aa:bb:cc:dd:ee:ff"
+vlan = 1
+name = "Philipp's laptop"
+ip = "10.0.1.10"
+netboot_image = "ubuntu-22.04"
+
+[[clients]]
+mac = "11:22:33:44:55:66"
+vlan = 20
+name = "thermostat"
+ip = "10.0.20.50"
+
+[[clients]]
+mac = "de:ad:be:ef:00:01"
+vlan = 1
+name = "workstation"
+```
+
+- **`ip`** — Optional. Static DHCP reservation. The DHCP server always assigns this IP instead of allocating from the dynamic range.
+- **`netboot_image`** — Optional. Subdirectory name within the VLAN's boot directory. Files are served from `<bootDir>/<netboot_image>/` for this client. If omitted, the VLAN's default boot directory is used.
+
+When a client with a `netboot_image` PXE-boots, the DHCP boot-filename points to the image-specific path (e.g. `ubuntu-22.04/pxelinux.0`), so different machines on the same VLAN can boot different OS images.
+
 ## Deployment
 
 Add to your gokrazy instance config:
@@ -198,6 +289,7 @@ The columns show:
 | `github.com/vishvananda/netlink` | Bridge, interface, address management |
 | `github.com/google/nftables` | NAT masquerade + isolation rules + traffic counters |
 | `github.com/insomniacslk/dhcp` | DHCPv4 server |
-| `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping file parsing |
+| `github.com/pin/tftp/v3` | TFTP server for PXE netboot |
+| `github.com/pelletier/go-toml/v2` | MAC mapping file parsing (VLAN, static IP, netboot image) |
 
 External: `hostapd` (statically compiled, bundled via gokrazy ExtraFilePaths)

@@ -20,8 +20,9 @@ The BPI-R1 has a Broadcom BCM53125 5-port Gigabit switch connected to the Allwin
 4. **IP forwarding** — Enable `net.ipv4.ip_forward`.
 5. **VLAN support** — Optionally assign VLAN IDs to individual LAN ports so that tagged traffic can be isolated or trunked. Clients can define VLAN-aware bridges or per-port VLANs in the configuration.
 6. **WiFi access point** — Run the onboard RTL8192CU WiFi as an access point, bridged into `br-lan` (or a separate VLAN bridge). WiFi AP mode is managed by a bundled statically-compiled `hostapd` binary, supervised as a subprocess.
-7. **Configuration file** — All settings are driven by a JSON configuration file. The daemon should work with sensible defaults if no config is provided.
-8. **gokrazy integration** — Designed to run as a gokrazy package. Network configuration is done via netlink and nftables Go libraries. `hostapd` is the only external binary, bundled as an extra file.
+7. **Netboot service** — PXE (TFTP) and HTTP boot server, configurable per-VLAN. Extends the DHCP server with boot options (next-server, boot-filename) so clients on enabled VLANs can network-boot. Serves boot artifacts via an embedded TFTP server and the HTTP boot endpoint.
+8. **Configuration file** — All settings are driven by a JSON configuration file. The daemon should work with sensible defaults if no config is provided.
+9. **gokrazy integration** — Designed to run as a gokrazy package. Network configuration is done via netlink and nftables Go libraries. `hostapd` is the only external binary, bundled as an extra file.
 
 ## Non-Goals (out of scope for v1)
 
@@ -29,27 +30,28 @@ The BPI-R1 has a Broadcom BCM53125 5-port Gigabit switch connected to the Allwin
 - Dynamic routing protocols (OSPF, BGP)
 - Firewall rules beyond basic NAT
 - Web UI
+- Netboot image building (users must supply their own boot artifacts)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      gokrazy-router                         │
-│                                                             │
-│  ┌──────────┐ ┌────────┐ ┌────────────┐ ┌───────────────┐  │
-│  │ netlink  │ │ DHCP   │ │ nftables   │ │ WiFi (hostapd │  │
-│  │ (bridge, │ │ server │ │ (NAT/      │ │  subprocess   │  │
-│  │  vlan,   │ │        │ │  masq.)    │ │  manager)     │  │
-│  │  addrs)  │ │        │ │            │ │               │  │
-│  └────┬─────┘ └───┬────┘ └─────┬──────┘ └──────┬────────┘  │
-│       │           │            │               │            │
-└───────┼───────────┼────────────┼───────────────┼────────────┘
-        │           │            │               │
-   ┌────▼────┐ ┌────▼────┐ ┌────▼─────┐  ┌──────▼──────┐
-   │ kernel  │ │ UDP:67  │ │ nf_tables│  │  hostapd    │
-   │ netlink │ │ on      │ │ kernel   │  │  (RTL8192CU │
-   │         │ │ br-lan  │ │          │  │   AP mode)  │
-   └─────────┘ └─────────┘ └──────────┘  └─────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           gokrazy-router                                │
+│                                                                          │
+│  ┌──────────┐ ┌────────┐ ┌────────────┐ ┌───────────────┐ ┌──────────┐  │
+│  │ netlink  │ │ DHCP   │ │ nftables   │ │ WiFi (hostapd │ │ Netboot  │  │
+│  │ (bridge, │ │ server │ │ (NAT/      │ │  subprocess   │ │ (TFTP +  │  │
+│  │  vlan,   │ │ (+PXE  │ │  masq.)    │ │  manager)     │ │  HTTP    │  │
+│  │  addrs)  │ │  opts) │ │            │ │               │ │  boot)   │  │
+│  └────┬─────┘ └───┬────┘ └─────┬──────┘ └──────┬────────┘ └──┬───┬──┘  │
+│       │           │            │               │             │   │      │
+└───────┼───────────┼────────────┼───────────────┼─────────────┼───┼──────┘
+        │           │            │               │             │   │
+   ┌────▼────┐ ┌────▼────┐ ┌────▼─────┐  ┌──────▼──────┐ ┌───▼┐ ┌▼────┐
+   │ kernel  │ │ UDP:67  │ │ nf_tables│  │  hostapd    │ │TFTP│ │HTTP │
+   │ netlink │ │ on      │ │ kernel   │  │  (RTL8192CU │ │:69 │ │boot │
+   │         │ │ br-lan  │ │          │  │   AP mode)  │ │    │ │port │
+   └─────────┘ └─────────┘ └──────────┘  └─────────────┘ └────┘ └─────┘
 ```
 
 ### Components
@@ -101,7 +103,101 @@ Manages the onboard RTL8192CU WiFi adapter as an access point:
 - `hostapd` binary must be provided as a statically-compiled ARM binary via gokrazy `ExtraFilePaths` (e.g. at `/usr/local/bin/hostapd`)
 - Supports configurable SSID, passphrase, channel, HT mode (802.11n), and country code
 
-#### 6. Configuration (`pkg/config`)
+#### 6. Netboot Service (`pkg/netboot`)
+
+Provides PXE and HTTP network boot, configurable per-VLAN:
+
+**TFTP server** (using `github.com/pin/tftp/v3`):
+
+- Listens on UDP port 69, bound to the router's IP on each netboot-enabled VLAN/bridge
+- Serves boot artifacts (pxelinux.0, kernels, initrds, iPXE scripts) from a configurable boot directory
+- Read-only; no write support needed
+
+**HTTP boot server**:
+
+- Serves the same boot directory over HTTP on a configurable port (default `:8069`)
+- Supports iPXE chainloading and UEFI HTTP Boot
+- Serves per-VLAN boot directories, routed by request source IP
+
+**DHCP PXE option injection**:
+
+- When netboot is enabled for a VLAN, the existing DHCP server adds:
+  - Option 66 (`next-server`) — router's IP on that VLAN
+  - Option 67 (`boot-filename`) — e.g. `pxelinux.0` or an iPXE script URL
+  - Option 60 (`vendor-class-identifier`) detection to distinguish legacy PXE, iPXE, and UEFI HTTP Boot clients
+  - Option 93 (`client-system-architecture`) to detect BIOS vs UEFI
+- For iPXE clients (identified by option 175), respond with an HTTP URL pointing to the HTTP boot endpoint instead of a TFTP path
+- For UEFI HTTP Boot clients (arch type 0x0010), respond with the HTTP boot URL directly
+
+**Boot directory layout**:
+
+```
+/data/netboot/
+├── vlan1/
+│   ├── pxelinux.0
+│   ├── ldlinux.c32
+│   ├── pxelinux.cfg/
+│   │   └── default
+│   ├── vmlinuz
+│   ├── initrd.img
+│   └── boot.ipxe
+├── vlan20/
+│   └── ...
+└── default/          # fallback if no VLAN-specific dir exists
+    └── ...
+```
+
+- Each VLAN can have its own boot directory, or fall back to a `default/` directory
+- The boot directory root is configurable (default `/data/netboot/`)
+
+**Per-VLAN configuration**:
+
+Each VLAN's `netboot` block controls:
+- `enabled` — whether netboot is active on this VLAN
+- `tftp` — enable/disable TFTP serving (default true when netboot enabled)
+- `http` — enable/disable HTTP boot serving (default true when netboot enabled)
+- `bootDir` — path to boot artifacts for this VLAN (default `<netbootDir>/<vlanName>/`)
+- `defaultBoot` — filename sent as DHCP option 67 for legacy PXE clients (default `pxelinux.0`)
+- `ipxeScript` — URL or filename sent to iPXE clients (default `boot.ipxe`)
+- `httpPort` — HTTP boot server port (default `:8069`, shared across VLANs)
+
+**MAC-to-IP and netboot image mapping**:
+
+The existing MAC mapping file (TOML) is extended with optional `ip` and `netboot_image` fields per client:
+
+```toml
+default_vlan = 30
+
+[[clients]]
+mac = "aa:bb:cc:dd:ee:ff"
+vlan = 1
+name = "Philipp's laptop"
+ip = "10.0.1.10"
+netboot_image = "ubuntu-22.04"
+
+[[clients]]
+mac = "11:22:33:44:55:66"
+vlan = 20
+name = "thermostat"
+hostname = "tado-bridge"
+ip = "10.0.20.50"
+
+[[clients]]
+mac = "de:ad:be:ef:00:01"
+vlan = 1
+name = "workstation"
+```
+
+- **`ip`** (optional) — Static DHCP reservation. When set, the DHCP server always assigns this IP to the client instead of allocating from the dynamic range. The IP must fall within the VLAN's subnet but may be outside the DHCP dynamic range.
+- **`netboot_image`** (optional) — Subdirectory name within the VLAN's boot directory. When set, the TFTP and HTTP boot servers serve files from `<bootDir>/<netboot_image>/` instead of the VLAN's default boot directory. The DHCP boot-filename option is adjusted to point to the image-specific path. If the subdirectory does not exist, the VLAN's default boot directory is used as fallback.
+
+The DHCP server integrates with the MAC map as follows:
+1. On DISCOVER/REQUEST, look up the client's MAC in the map
+2. If an `ip` field is present, return that IP (skip dynamic allocation)
+3. If netboot is enabled on the client's VLAN and `netboot_image` is set, adjust the boot-filename DHCP option to the image-specific path
+4. Static IPs are excluded from the dynamic allocation pool to prevent conflicts
+
+#### 7. Configuration (`pkg/config`)
 
 JSON configuration file, loaded at startup:
 
@@ -136,11 +232,36 @@ JSON configuration file, loaded at startup:
         "dns": ["1.1.1.1"]
       },
       "nat": true
+    },
+    {
+      "id": 1,
+      "name": "trusted",
+      "ports": ["lan1"],
+      "address": "10.0.1.1/24",
+      "dhcp": {
+        "enabled": true,
+        "rangeStart": "10.0.1.100",
+        "rangeEnd": "10.0.1.250",
+        "dns": ["1.1.1.1", "8.8.8.8"]
+      },
+      "nat": true,
+      "netboot": {
+        "enabled": true,
+        "tftp": true,
+        "http": true,
+        "bootDir": "/data/netboot/trusted",
+        "defaultBoot": "pxelinux.0",
+        "ipxeScript": "boot.ipxe"
+      }
     }
   ],
   "nat": {
     "enabled": true,
     "outInterface": "wan"
+  },
+  "netboot": {
+    "dir": "/data/netboot",
+    "httpPort": ":8069"
   },
   "wifi": {
     "enabled": true,
@@ -158,12 +279,13 @@ JSON configuration file, loaded at startup:
 }
 ```
 
-#### 7. Main Entry Point (`cmd/gokrazy-router`)
+#### 8. Main Entry Point (`cmd/gokrazy-router`)
 
 - Loads configuration
 - Runs network setup
 - Starts WiFi AP (if enabled) — launches hostapd subprocess
-- Starts DHCP server(s)
+- Starts DHCP server(s) — with PXE options on netboot-enabled VLANs
+- Starts netboot TFTP and HTTP servers (if any VLAN has netboot enabled)
 - Installs NAT rules
 - Blocks forever (supervised by gokrazy init)
 - Cleans up nftables rules and stops hostapd on SIGTERM
@@ -175,6 +297,8 @@ JSON configuration file, loaded at startup:
 | `github.com/vishvananda/netlink` | Bridge, VLAN, interface, address, route management |
 | `github.com/google/nftables` | NAT masquerade rules |
 | `github.com/insomniacslk/dhcp` | DHCPv4 server |
+| `github.com/pin/tftp/v3` | TFTP server for PXE netboot |
+| `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping file parsing |
 
 ### External binaries
 
@@ -200,8 +324,12 @@ gokrazy-router/
 │   │   └── nat.go
 │   ├── vlan/
 │   │   └── vlan.go
-│   └── wifi/
-│       └── wifi.go
+│   ├── wifi/
+│   │   └── wifi.go
+│   └── netboot/
+│       ├── netboot.go
+│       ├── tftp.go
+│       └── http.go
 ├── spec.md
 ├── go.mod
 └── README.md
@@ -215,8 +343,9 @@ gokrazy-router/
 4. If WiFi enabled: generate `hostapd.conf`, add `wlan0` to bridge, start hostapd subprocess
 5. Enable IP forwarding (`/proc/sys/net/ipv4/ip_forward`)
 6. Install nftables NAT masquerade rules
-7. Start DHCP server(s) on bridge interface(s)
-8. Wait for signals; stop hostapd and clean up nftables on SIGTERM
+7. Start DHCP server(s) on bridge interface(s) — inject PXE boot options on netboot-enabled VLANs
+8. If netboot enabled on any VLAN: start TFTP server (UDP :69) and HTTP boot server (TCP :8069)
+9. Wait for signals; stop hostapd and clean up nftables on SIGTERM
 
 ## gokrazy PackageConfig
 
