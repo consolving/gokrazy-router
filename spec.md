@@ -30,27 +30,28 @@ The BPI-R1 has a Broadcom BCM53125 5-port Gigabit switch connected to the Allwin
 - Dynamic routing protocols (OSPF, BGP)
 - Firewall rules beyond basic NAT
 - Web UI
+- Netboot image building (users must supply their own boot artifacts)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      gokrazy-router                         │
-│                                                             │
-│  ┌──────────┐ ┌────────┐ ┌────────────┐ ┌───────────────┐  │
-│  │ netlink  │ │ DHCP   │ │ nftables   │ │ WiFi (hostapd │  │
-│  │ (bridge, │ │ server │ │ (NAT/      │ │  subprocess   │  │
-│  │  vlan,   │ │        │ │  masq.)    │ │  manager)     │  │
-│  │  addrs)  │ │        │ │            │ │               │  │
-│  └────┬─────┘ └───┬────┘ └─────┬──────┘ └──────┬────────┘  │
-│       │           │            │               │            │
-└───────┼───────────┼────────────┼───────────────┼────────────┘
-        │           │            │               │
-   ┌────▼────┐ ┌────▼────┐ ┌────▼─────┐  ┌──────▼──────┐
-   │ kernel  │ │ UDP:67  │ │ nf_tables│  │  hostapd    │
-   │ netlink │ │ on      │ │ kernel   │  │  (RTL8192CU │
-   │         │ │ br-lan  │ │          │  │   AP mode)  │
-   └─────────┘ └─────────┘ └──────────┘  └─────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           gokrazy-router                                │
+│                                                                          │
+│  ┌──────────┐ ┌────────┐ ┌────────────┐ ┌───────────────┐ ┌──────────┐  │
+│  │ netlink  │ │ DHCP   │ │ nftables   │ │ WiFi (hostapd │ │ Netboot  │  │
+│  │ (bridge, │ │ server │ │ (NAT/      │ │  subprocess   │ │ (TFTP +  │  │
+│  │  vlan,   │ │ (+PXE  │ │  masq.)    │ │  manager)     │ │  HTTP    │  │
+│  │  addrs)  │ │  opts) │ │            │ │               │ │  boot)   │  │
+│  └────┬─────┘ └───┬────┘ └─────┬──────┘ └──────┬────────┘ └──┬───┬──┘  │
+│       │           │            │               │             │   │      │
+└───────┼───────────┼────────────┼───────────────┼─────────────┼───┼──────┘
+        │           │            │               │             │   │
+   ┌────▼────┐ ┌────▼────┐ ┌────▼─────┐  ┌──────▼──────┐ ┌───▼┐ ┌▼────┐
+   │ kernel  │ │ UDP:67  │ │ nf_tables│  │  hostapd    │ │TFTP│ │HTTP │
+   │ netlink │ │ on      │ │ kernel   │  │  (RTL8192CU │ │:69 │ │boot │
+   │         │ │ br-lan  │ │          │  │   AP mode)  │ │    │ │port │
+   └─────────┘ └─────────┘ └──────────┘  └─────────────┘ └────┘ └─────┘
 ```
 
 ### Components
@@ -166,11 +167,36 @@ JSON configuration file, loaded at startup:
         "dns": ["1.1.1.1"]
       },
       "nat": true
+    },
+    {
+      "id": 1,
+      "name": "trusted",
+      "ports": ["lan1"],
+      "address": "10.0.1.1/24",
+      "dhcp": {
+        "enabled": true,
+        "rangeStart": "10.0.1.100",
+        "rangeEnd": "10.0.1.250",
+        "dns": ["1.1.1.1", "8.8.8.8"]
+      },
+      "nat": true,
+      "netboot": {
+        "enabled": true,
+        "tftp": true,
+        "http": true,
+        "bootDir": "/data/netboot/trusted",
+        "defaultBoot": "pxelinux.0",
+        "ipxeScript": "boot.ipxe"
+      }
     }
   ],
   "nat": {
     "enabled": true,
     "outInterface": "wan"
+  },
+  "netboot": {
+    "dir": "/data/netboot",
+    "httpPort": ":8069"
   },
   "wifi": {
     "enabled": true,
