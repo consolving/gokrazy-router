@@ -1,14 +1,45 @@
-// Command gokrazy-router-status queries the router's status API and displays
-// port link states and per-client traffic counters.
+// Command grcli queries the router's HTTP API for status, MAC export,
+// and netboot image management.
 //
-// It can also export the list of known MAC addresses as a TOML file for
-// VLAN assignment, and merge new clients into an existing mapping file.
+// Usage:
+//
+//	grcli [flags] [command]
+//
+// Commands:
+//
+//	status              Show port and client status (default)
+//	netboot list        List netboot images
+//	netboot upload      Upload a netboot image (tar archive or single file)
+//	netboot delete      Delete a netboot image or file
+//
+// Flags:
+//
+//	--host string       Router API address (default "10.0.0.1:8080")
+//	--json              Output raw JSON
+//
+// Status flags:
+//
+//	--export-toml       Export known MACs as TOML mac-vlan-map
+//	--merge string      Merge new MACs into existing TOML file
+//
+// Netboot upload flags:
+//
+//	--name string       Image name (required)
+//	--file string       Path to tar/tar.gz archive or single file
+//	--dest string       Destination path within image (for single file upload)
+//
+// Netboot delete flags:
+//
+//	--name string       Image name (required)
+//	--path string       File path within image (omit to delete entire image)
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"text/tabwriter"
@@ -67,13 +98,73 @@ type Status struct {
 }
 
 func main() {
-	host := flag.String("host", "10.0.0.1:8080", "router status API address")
+	host := flag.String("host", "10.0.0.1:8080", "router API address")
 	jsonOut := flag.Bool("json", false, "output raw JSON")
 	exportTOML := flag.Bool("export-toml", false, "export known MACs as TOML mac-vlan-map")
 	mergeFile := flag.String("merge", "", "merge new MACs into existing TOML file (use with --export-toml)")
+	// Netboot flags.
+	nbName := flag.String("name", "", "netboot image name")
+	nbFile := flag.String("file", "", "path to tar/tar.gz archive or single file (netboot upload)")
+	nbDest := flag.String("dest", "", "destination path within image (single file upload)")
+	nbPath := flag.String("path", "", "file path within image (netboot delete)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: grcli [flags] [command]
+
+Commands:
+  status              Show port and client status (default)
+  netboot list        List netboot images
+  netboot upload      Upload a netboot image (tar archive or single file)
+  netboot delete      Delete a netboot image or file
+
+Flags:
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	resp, err := http.Get(fmt.Sprintf("http://%s/status", *host))
+	args := flag.Args()
+	cmd := "status"
+	if len(args) >= 1 {
+		cmd = args[0]
+	}
+
+	switch cmd {
+	case "status":
+		runStatus(*host, *jsonOut, *exportTOML, *mergeFile)
+	case "netboot":
+		subcmd := ""
+		if len(args) >= 2 {
+			subcmd = args[1]
+		}
+		switch subcmd {
+		case "list":
+			runNetbootList(*host, *jsonOut)
+		case "upload":
+			if *nbName == "" || *nbFile == "" {
+				fmt.Fprintln(os.Stderr, "error: --name and --file are required for netboot upload")
+				os.Exit(1)
+			}
+			runNetbootUpload(*host, *nbName, *nbFile, *nbDest)
+		case "delete":
+			if *nbName == "" {
+				fmt.Fprintln(os.Stderr, "error: --name is required for netboot delete")
+				os.Exit(1)
+			}
+			runNetbootDelete(*host, *nbName, *nbPath)
+		default:
+			fmt.Fprintln(os.Stderr, "error: unknown netboot subcommand (use: list, upload, delete)")
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown command %q\n", cmd)
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+func runStatus(host string, jsonOut, exportTOML bool, mergeFile string) {
+	resp, err := http.Get(fmt.Sprintf("http://%s/status", host))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -86,12 +177,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *exportTOML {
-		exportMACMap(s, *mergeFile)
+	if exportTOML {
+		exportMACMap(s, mergeFile)
 		return
 	}
 
-	if *jsonOut {
+	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.Encode(s)
@@ -294,4 +385,136 @@ func exportMACMap(s Status, mergeFile string) {
 		os.Exit(1)
 	}
 	os.Stdout.Write(data)
+}
+
+// runNetbootList fetches and displays the list of netboot images.
+func runNetbootList(host string, jsonOut bool) {
+	resp, err := http.Get(fmt.Sprintf("http://%s/netboot/images", host))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "error: server returned %s\n", resp.Status)
+		os.Exit(1)
+	}
+
+	var result struct {
+		Images []struct {
+			Name  string `json:"name"`
+			Files int    `json:"files"`
+			Size  uint64 `json:"size"`
+		} `json:"images"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Fprintf(os.Stderr, "error decoding response: %v\n", err)
+		os.Exit(1)
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(result)
+		return
+	}
+
+	if len(result.Images) == 0 {
+		fmt.Println("No netboot images found.")
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "NAME\tFILES\tSIZE\n")
+	for _, img := range result.Images {
+		fmt.Fprintf(w, "%s\t%d\t%s\n", img.Name, img.Files, humanBytes(img.Size))
+	}
+	w.Flush()
+}
+
+// runNetbootUpload uploads a tar archive or single file as a netboot image.
+func runNetbootUpload(host, name, file, dest string) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading %s: %v\n", file, err)
+		os.Exit(1)
+	}
+
+	var url string
+	var method string
+	var contentType string
+
+	if dest != "" {
+		// Single file upload.
+		url = fmt.Sprintf("http://%s/netboot/images/%s/%s", host, name, dest)
+		method = http.MethodPut
+		contentType = "application/octet-stream"
+	} else {
+		// Tar archive upload.
+		url = fmt.Sprintf("http://%s/netboot/images/%s", host, name)
+		method = http.MethodPost
+		contentType = "application/gzip"
+	}
+
+	req, err := http.NewRequest(method, url, bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "error: server returned %s: %s\n", resp.Status, body)
+		os.Exit(1)
+	}
+
+	if dest != "" {
+		fmt.Printf("Uploaded %s to image %s/%s (%s)\n", file, name, dest, humanBytes(uint64(len(data))))
+	} else {
+		fmt.Printf("Uploaded image %s from %s (%s)\n", name, file, humanBytes(uint64(len(data))))
+	}
+}
+
+// runNetbootDelete deletes a netboot image or a single file within it.
+func runNetbootDelete(host, name string, path string) {
+	var url string
+	if path != "" {
+		url = fmt.Sprintf("http://%s/netboot/images/%s/%s", host, name, path)
+	} else {
+		url = fmt.Sprintf("http://%s/netboot/images/%s", host, name)
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "error: server returned %s: %s\n", resp.Status, body)
+		os.Exit(1)
+	}
+
+	if path != "" {
+		fmt.Printf("Deleted %s/%s\n", name, path)
+	} else {
+		fmt.Printf("Deleted image %s\n", name)
+	}
 }

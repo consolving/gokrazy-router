@@ -197,7 +197,91 @@ The DHCP server integrates with the MAC map as follows:
 3. If netboot is enabled on the client's VLAN and `netboot_image` is set, adjust the boot-filename DHCP option to the image-specific path
 4. Static IPs are excluded from the dynamic allocation pool to prevent conflicts
 
-#### 7. Configuration (`pkg/config`)
+#### 7. Netboot Image Management API
+
+The router daemon exposes netboot image management endpoints on the existing `:8080` HTTP server. The `grcli` tool provides a CLI interface to these endpoints.
+
+**Endpoints**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/netboot/images` | List all images (directories under `netboot.dir`) |
+| `GET` | `/netboot/images/{name}` | List files in a specific image |
+| `POST` | `/netboot/images/{name}` | Upload a tar archive, extracted to `<dir>/<name>/` |
+| `PUT` | `/netboot/images/{name}/{path...}` | Upload a single file to `<dir>/<name>/<path>` |
+| `DELETE` | `/netboot/images/{name}` | Delete an entire image directory |
+| `DELETE` | `/netboot/images/{name}/{path...}` | Delete a single file from an image |
+
+**Response format** (JSON):
+
+- `GET /netboot/images` returns `{"images": [{"name": "ubuntu-22.04", "files": 5, "size": 123456789}]}`
+- `GET /netboot/images/{name}` returns `{"name": "ubuntu-22.04", "files": [{"path": "vmlinuz", "size": 12345678}, ...]}`
+- `POST` accepts `Content-Type: application/x-tar` or `application/gzip` (tar.gz). Returns `{"name": "ubuntu-22.04", "files": 5, "size": 123456789}`
+- `PUT` accepts any `Content-Type`. Returns `{"path": "ubuntu-22.04/vmlinuz", "size": 12345678}`
+- `DELETE` returns `204 No Content` on success
+
+**Safety**:
+
+- Path traversal is rejected (no `..` components)
+- Image names must match `[a-zA-Z0-9._-]+`
+- Maximum upload size is configurable (default 2 GiB)
+
+#### 8. CLI Tool (`cmd/grcli`)
+
+The `grcli` command-line tool queries the router's HTTP API for status, MAC export, and netboot image management. It replaces the previous `gokrazy-router-status` tool.
+
+**Usage**:
+
+```
+grcli [flags] [command]
+
+Commands:
+  status              Show port and client status (default)
+  netboot list        List netboot images
+  netboot upload      Upload a netboot image (tar archive or single file)
+  netboot delete      Delete a netboot image or file
+
+Flags:
+  --host string       Router API address (default "10.0.0.1:8080")
+  --json              Output raw JSON
+
+Status flags:
+  --export-toml       Export known MACs as TOML mac-vlan-map
+  --merge string      Merge new MACs into existing TOML file
+
+Netboot upload flags:
+  --name string       Image name (required)
+  --file string       Path to tar/tar.gz archive or single file
+  --dest string       Destination path within image (for single file upload)
+
+Netboot delete flags:
+  --name string       Image name (required)
+  --path string       File path within image (omit to delete entire image)
+```
+
+**Examples**:
+
+```bash
+# Show router status
+grcli --host 10.0.1.1:8080
+
+# List netboot images
+grcli --host 10.0.1.1:8080 netboot list
+
+# Upload a tar archive as a netboot image
+grcli --host 10.0.1.1:8080 netboot upload --name ubuntu-22.04 --file ubuntu-netboot.tar.gz
+
+# Upload a single kernel to an existing image
+grcli --host 10.0.1.1:8080 netboot upload --name ubuntu-22.04 --file vmlinuz --dest vmlinuz
+
+# Delete an image
+grcli --host 10.0.1.1:8080 netboot delete --name ubuntu-22.04
+
+# Delete a single file from an image
+grcli --host 10.0.1.1:8080 netboot delete --name ubuntu-22.04 --path initrd.img
+```
+
+#### 9. Configuration (`pkg/config`)
 
 JSON configuration file, loaded at startup:
 
@@ -279,7 +363,7 @@ JSON configuration file, loaded at startup:
 }
 ```
 
-#### 8. Main Entry Point (`cmd/gokrazy-router`)
+#### 10. Main Entry Point (`cmd/gokrazy-router`)
 
 - Loads configuration
 - Runs network setup
@@ -311,7 +395,9 @@ JSON configuration file, loaded at startup:
 ```
 gokrazy-router/
 ├── cmd/
-│   └── gokrazy-router/
+│   ├── gokrazy-router/
+│   │   └── main.go
+│   └── grcli/
 │       └── main.go
 ├── pkg/
 │   ├── config/

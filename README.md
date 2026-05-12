@@ -13,7 +13,7 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
 - **Netboot service** — Per-VLAN PXE (TFTP) and HTTP boot server. DHCP automatically injects boot options for legacy PXE, iPXE, and UEFI HTTP Boot clients. Serve kernels, initrds, and boot scripts from a configurable boot directory.
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
-- **Status CLI** — `gokrazy-router-status` queries the API and prints port/client tables
+- **Status CLI** — `grcli` queries the API and prints port/client tables, manages netboot images
 
 ## Hardware
 
@@ -240,8 +240,8 @@ The `hostapd` binary must be statically compiled for ARMv7. Use `build-hostapd.s
 # Router daemon
 go build ./cmd/gokrazy-router/
 
-# Status CLI
-go build ./cmd/gokrazy-router-status/
+# CLI tool
+go build ./cmd/grcli/
 
 # Cross-compile hostapd
 ./build-hostapd.sh
@@ -254,8 +254,8 @@ The daemon serves a JSON status endpoint at `http://<router-ip>:8080/status` wit
 Use the CLI tool to query it:
 
 ```bash
-gokrazy-router-status --host 10.0.31.1
-gokrazy-router-status --host 10.0.31.1 --json
+grcli --host 10.0.31.1:8080
+grcli --host 10.0.31.1:8080 --json
 ```
 
 Example output:
@@ -281,6 +281,38 @@ The columns show:
 - **UL / DL** — Current session traffic (reset on reconnect)
 - **TOTAL UL / TOTAL DL** — Accumulated traffic across all sessions since boot
 - **SPEED** — Negotiated port link speed and duplex
+
+## Netboot Image Management API
+
+The daemon also exposes netboot image management on `:8080`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/netboot/images` | List all images |
+| `GET` | `/netboot/images/{name}` | List files in an image |
+| `POST` | `/netboot/images/{name}` | Upload a tar/tar.gz archive as an image |
+| `PUT` | `/netboot/images/{name}/{path...}` | Upload a single file to an image |
+| `DELETE` | `/netboot/images/{name}` | Delete an entire image |
+| `DELETE` | `/netboot/images/{name}/{path...}` | Delete a single file from an image |
+
+### Managing images with `grcli`
+
+```bash
+# List all netboot images
+grcli --host 10.0.1.1:8080 netboot list
+
+# Upload a tar.gz archive as a new image
+grcli --host 10.0.1.1:8080 netboot upload --name ubuntu-22.04 --file ubuntu-netboot.tar.gz
+
+# Upload/replace a single file in an existing image
+grcli --host 10.0.1.1:8080 netboot upload --name ubuntu-22.04 --file vmlinuz --dest vmlinuz
+
+# Delete an entire image
+grcli --host 10.0.1.1:8080 netboot delete --name ubuntu-22.04
+
+# Delete a single file from an image
+grcli --host 10.0.1.1:8080 netboot delete --name ubuntu-22.04 --path initrd.img
+```
 
 ## Dependencies
 
