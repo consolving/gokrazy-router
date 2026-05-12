@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goarch: [arm, arm64]
+        goarch: [amd64, arm, arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -34,5 +34,5 @@ jobs:
       - name: Build
         env:
           GOARCH: ${{ matrix.goarch }}
-          GOARM: "7"
+          GOARM: ${{ matrix.goarch == 'arm' && '7' || '' }}
         run: go build ./cmd/...
