@@ -1,0 +1,69 @@
+{
+  "wan": {"interface": "wan", "mode": "dhcp"},
+  "lan": {"bridge": "br-lan", "interfaces": [], "address": "10.0.0.1/24", "dhcp": {"enabled": false}},
+  "vlans": [
+    {
+      "id": 1, "name": "trusted", "ports": ["lan1"],
+      "address": "10.0.1.1/24",
+      "dhcp": {
+        "enabled": true,
+        "rangeStart": "10.0.1.100",
+        "rangeEnd": "10.0.1.250",
+        "leaseDuration": "12h",
+        "dns": ["1.1.1.1", "8.8.8.8"]
+      },
+      "nat": true,
+      "netboot": {
+        "enabled": true,
+        "tftp": true,
+        "http": true,
+        "bootDir": "/data/netboot/trusted",
+        "defaultBoot": "pxelinux.0",
+        "ipxeScript": "boot.ipxe"
+      }
+    },
+    {
+      "id": 20, "name": "iot", "ports": ["lan2"],
+      "address": "10.0.20.1/24",
+      "dhcp": {
+        "enabled": true,
+        "rangeStart": "10.0.20.100",
+        "rangeEnd": "10.0.20.250",
+        "leaseDuration": "12h",
+        "dns": ["1.1.1.1", "8.8.8.8"]
+      },
+      "nat": true, "isolated": true
+    },
+    {
+      "id": 30, "name": "open", "ports": ["lan3"],
+      "address": "10.0.30.1/24",
+      "dhcp": {
+        "enabled": true,
+        "rangeStart": "10.0.30.100",
+        "rangeEnd": "10.0.30.250",
+        "leaseDuration": "12h",
+        "dns": ["1.1.1.1", "8.8.8.8"]
+      },
+      "nat": true
+    }
+  ],
+  "nat": {"enabled": true, "outInterface": "wan"},
+  "netboot": {
+    "dir": "/data/netboot",
+    "httpPort": ":8069"
+  },
+  "wifi": {
+    "enabled": true, "interface": "wlan0",
+    "address": "10.0.31.1/25",
+    "dhcp": {
+      "enabled": true,
+      "rangeStart": "10.0.31.100",
+      "rangeEnd": "10.0.31.126",
+      "leaseDuration": "12h",
+      "dns": ["1.1.1.1", "8.8.8.8"]
+    },
+    "macMapFile": "/etc/gokrazy-router-macmap.toml",
+    "ssid": "gokrazy", "passphrase": "changeme123",
+    "channel": 6, "hwMode": "g", "countryCode": "DE", "wpa": 2
+  }
+}

@@ -48,6 +48,24 @@ BananaPi R1 with a Broadcom BCM53125 5-port Gigabit switch. The Linux kernel's `
 
 All settings are driven by a JSON file (default `/etc/gokrazy-router.json`). If no config is provided, a flat bridge mode with sensible defaults is used.
 
+### Configuration files
+
+The router uses up to three configuration files:
+
+| File | Format | Location on router | Purpose |
+|------|--------|-------------------|---------|
+| Router config | JSON | `/etc/gokrazy-router.json` | Main config: WAN, LAN, VLANs, NAT, WiFi, netboot |
+| MAC map | TOML | Path set in `wifi.macMapFile` (e.g. `/etc/gokrazy-router-macmap.toml`) | MAC-to-VLAN assignment, static IP reservations, per-client netboot images |
+| Boot artifacts | Directory | Path set in `netboot.dir` (e.g. `/data/netboot/`) | Kernels, initrds, iPXE scripts, pxelinux configs |
+
+On a gokrazy device, the JSON config and MAC map are deployed via `ExtraFileContents` in the gokrazy instance config. Boot artifacts are uploaded at runtime via the HTTP API (see [Netboot Image Management API](#netboot-image-management-api)) or placed on persistent storage mounted at `/data/`.
+
+Example files are provided in the [`netboot/`](netboot/) directory:
+- `gokrazy-router.json` — Full router config with netboot enabled on VLAN 1
+- `macmap.toml` — MAC mapping with static IPs and netboot image assignments
+- `boot.ipxe` — Example iPXE boot script
+- `pxelinux.cfg.default` — Example pxelinux config for legacy PXE
+
 ### VLAN mode
 
 ```json
@@ -225,14 +243,18 @@ Add to your gokrazy instance config:
         "/usr/local/bin/hostapd": "hostapd-armv7-static"
       },
       "ExtraFileContents": {
-        "/etc/gokrazy-router.json": "<your JSON config here>"
+        "/etc/gokrazy-router.json": "<your JSON config here>",
+        "/etc/gokrazy-router-macmap.toml": "<your TOML mac map here>"
       }
     }
   }
 }
 ```
 
-The `hostapd` binary must be statically compiled for ARMv7. Use `build-hostapd.sh` to cross-compile it via Docker.
+- **`/etc/gokrazy-router.json`** — The main router configuration (required). See [`netboot/gokrazy-router.json`](netboot/gokrazy-router.json) for a complete example.
+- **`/etc/gokrazy-router-macmap.toml`** — MAC mapping file (optional). Only needed if `wifi.macMapFile` is set in the JSON config. See [`netboot/macmap.toml`](netboot/macmap.toml).
+- **`/usr/local/bin/hostapd`** — Statically compiled hostapd for ARMv7 (required for WiFi). Use `build-hostapd.sh` to cross-compile it via Docker.
+- **`/data/netboot/`** — Boot artifacts directory (optional). Uploaded at runtime via `grcli netboot upload` or pre-populated on persistent storage.
 
 ## Building locally
 
