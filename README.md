@@ -265,9 +265,19 @@ go build ./cmd/gokrazy-router/
 # CLI tool
 go build ./cmd/grcli/
 
+# Cross-compile for BananaPi R1 (ARMv7)
+GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/gokrazy-router/
+GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/grcli/
+
+# Build for amd64 (e.g. x86 router or VM)
+GOOS=linux GOARCH=amd64 go build ./cmd/gokrazy-router/
+GOOS=linux GOARCH=amd64 go build ./cmd/grcli/
+
 # Cross-compile hostapd
 ./build-hostapd.sh
 ```
+
+Both `linux/arm` (ARMv7) and `linux/amd64` are supported build targets.
 
 ## Status API
 
