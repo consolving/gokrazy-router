@@ -8,13 +8,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/consolving/gokrazy-router/pkg/config"
 	"github.com/consolving/gokrazy-router/pkg/dhcp"
+	"github.com/consolving/gokrazy-router/pkg/mount"
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
+	"github.com/consolving/gokrazy-router/pkg/pxe"
+	"github.com/consolving/gokrazy-router/pkg/smb"
 	"github.com/consolving/gokrazy-router/pkg/status"
 	"github.com/consolving/gokrazy-router/pkg/vlan"
 	"github.com/consolving/gokrazy-router/pkg/wifi"
@@ -34,20 +39,48 @@ func main() {
 		cfg = config.Default()
 	}
 
+	// Expand ${ENV} references in service configuration.
+	cfg.ExpandEnv()
+
+	// 0. Optional: mount a disk used by SMB/PXE/extras config.
+	if cfg.Services.Mount.Enabled {
+		if err := mount.Mount(cfg.Services.Mount); err != nil {
+			log.Fatalf("mount: %v", err)
+		}
+		defer mount.Unmount(cfg.Services.Mount)
+	}
+
+	// Load optional extras file from the mounted volume. It overrides/extends
+	// reservations, PXE images and SMB users. Reload happens on every restart.
+	if cfg.Services.ExtrasFile != "" {
+		if extras, err := config.LoadExtras(cfg.Services.ExtrasFile); err != nil {
+			log.Printf("extras: %v (continuing without)", err)
+		} else {
+			cfg.ApplyExtras(extras)
+			log.Printf("extras: loaded %s", cfg.Services.ExtrasFile)
+		}
+	}
+
+	// Derive default service paths from the mount target.
+	if cfg.Services.SMB.Enabled && cfg.Services.SMB.SharePath == "" {
+		cfg.Services.SMB.SharePath = cfg.Services.Mount.Target
+	}
+	if cfg.Services.PXE.Enabled && cfg.Services.PXE.TFTPRoot == "" {
+		cfg.Services.PXE.TFTPRoot = filepath.Join(cfg.Services.Mount.Target, "tftpboot")
+	}
+
 	// 1. Network setup: either VLAN mode or flat bridge mode.
 	vlanMode := len(cfg.VLANs) > 0
 	var vlanBridges []vlan.VLANBridge
 
 	if vlanMode {
-		// VLAN mode: create per-VLAN bridges with DSA port membership.
 		log.Printf("vlan: configuring %d VLANs", len(cfg.VLANs))
 		vlanBridges, err = vlan.Setup(cfg.VLANs)
 		if err != nil {
 			log.Fatalf("vlan: %v", err)
 		}
-		_ = vlanBridges // used below for inter-VLAN isolation
+		_ = vlanBridges
 	} else {
-		// Flat mode: single bridge for all LAN ports.
 		_, err = netsetup.Setup(cfg.LAN.Bridge, cfg.LAN.Interfaces, cfg.LAN.Address)
 		if err != nil {
 			log.Fatalf("netsetup: %v", err)
@@ -63,7 +96,6 @@ func main() {
 	var natMgr *nat.Manager
 	if cfg.NAT.Enabled {
 		if vlanMode {
-			// In VLAN mode, set up NAT for each VLAN that has nat=true.
 			var initialized bool
 			for _, vc := range cfg.VLANs {
 				if !vc.NAT {
@@ -99,7 +131,6 @@ func main() {
 
 	// 3b. Install inter-VLAN isolation rules for isolated VLANs.
 	if vlanMode && natMgr != nil {
-		// Collect all VLAN bridge names.
 		var allBridges []string
 		for _, vc := range cfg.VLANs {
 			allBridges = append(allBridges, vlan.BridgeName(vc.ID))
@@ -134,23 +165,17 @@ func main() {
 		log.Printf("status monitor: %v (continuing without)", err)
 	}
 
+	var activeServices []string
+
 	// 5. Start WiFi AP (hostapd).
 	var wifiAP *wifi.AP
 	if cfg.WiFi.Enabled {
-		// Wait for the WiFi interface to appear (kernel module may still be loading).
 		log.Printf("wifi: waiting for %s to appear...", wifiIface)
-
 		if err := waitForInterface(wifiIface, 120*time.Second); err != nil {
 			log.Printf("wifi: %v — continuing without WiFi", err)
 		} else {
 			log.Printf("wifi: %s is available", wifiIface)
 
-			// Determine bridge parameter for hostapd.
-			// In VLAN mode with macMap: bridge wlan0 into the default VLAN bridge
-			// so unmatched clients land there. Matched clients get VLAN sub-interfaces
-			// bridged via hostapd's vlan_bridge directive.
-			// In flat mode with explicit bridge: use that bridge.
-			// In routed mode (address set, no macMap): no bridge.
 			wifiBridge := ""
 			if vlanMode && cfg.WiFi.MacMapFile != "" {
 				defaultVLAN := cfg.WiFi.DefaultVLAN
@@ -167,8 +192,6 @@ func main() {
 			if err != nil {
 				log.Fatalf("wifi: %v", err)
 			}
-
-			// Log WLAN client events and update status monitor.
 			ap.OnClient(func(ev wifi.ClientEvent) {
 				if ev.Associated {
 					log.Printf("wifi: client %s connected via WLAN", ev.MAC)
@@ -181,26 +204,18 @@ func main() {
 					}
 				}
 			})
-
 			if err := ap.Start(); err != nil {
 				log.Fatalf("wifi: start: %v", err)
 			}
 			wifiAP = ap
-
-			// Wire WiFi station info into status monitor via hostapd control socket.
 			if mon != nil {
 				mon.SetWiFiSource(&wifiStationAdapter{ap: ap})
 			}
-
-			// Routed mode: assign IP to wlan0, add NAT for WiFi subnet.
-			// Skip in VLAN mode — WiFi clients get IPs from per-VLAN DHCP servers.
 			if cfg.WiFi.Address != "" && wifiAP.MacMap() == nil {
 				if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
 					log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
 				}
 				log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
-
-				// Add WiFi subnet to NAT masquerade.
 				if natMgr != nil {
 					_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
 					if err != nil {
@@ -216,7 +231,6 @@ func main() {
 
 	// 6. Start DHCP servers.
 	if vlanMode {
-		// Start a DHCP server on each VLAN bridge that has DHCP enabled.
 		for _, vc := range cfg.VLANs {
 			if !vc.DHCP.Enabled {
 				continue
@@ -233,6 +247,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("dhcp vlan %d: %v", vc.ID, err)
 			}
+			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address))
 			if mon != nil {
 				vlanName := vc.Name
 				if vlanName == "" {
@@ -256,9 +271,9 @@ func main() {
 				}
 			}(vc.ID)
 			log.Printf("dhcp: started on %s for VLAN %d (%s)", bridgeName, vc.ID, vc.Name)
+			activeServices = append(activeServices, fmt.Sprintf("DHCP(VLAN%d)", vc.ID))
 		}
 	} else if cfg.LAN.DHCP.Enabled {
-		// Flat mode: single DHCP server on the LAN bridge.
 		srv, err := dhcp.New(
 			cfg.LAN.Bridge,
 			cfg.LAN.Address,
@@ -270,8 +285,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp: %v", err)
 		}
-
-		// Register lease callback for traffic monitoring.
+		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address))
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "L"); err != nil {
@@ -284,12 +298,12 @@ func main() {
 				}
 			})
 		}
-
 		go func() {
 			if err := srv.Run(); err != nil {
 				log.Fatalf("dhcp server (LAN): %v", err)
 			}
 		}()
+		activeServices = append(activeServices, "DHCP(LAN)")
 	}
 
 	// 7. Start DHCP server on WiFi interface (routed mode only, not in VLAN mode).
@@ -305,7 +319,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp wifi: %v", err)
 		}
-
+		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address))
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "W"); err != nil {
@@ -318,15 +332,48 @@ func main() {
 				}
 			})
 		}
-
 		go func() {
 			if err := srv.Run(); err != nil {
 				log.Fatalf("dhcp server (WiFi): %v", err)
 			}
 		}()
+		activeServices = append(activeServices, "DHCP(WiFi)")
 	}
 
-	// 8. Start status HTTP API.
+	// 8. Start optional SMB server.
+	var smbServer *smb.Server
+	if cfg.Services.SMB.Enabled {
+		smbServer = smb.New(cfg.Services.SMB)
+		if err := smbServer.Start(); err != nil {
+			log.Printf("smb: %v (continuing without SMB)", err)
+		} else {
+			activeServices = append(activeServices, fmt.Sprintf("SMB(%s@%s)", cfg.Services.SMB.ShareName, cfg.Services.SMB.Listen))
+		}
+	}
+
+	// 9. Start optional PXE/TFTP server.
+	if cfg.Services.PXE.Enabled {
+		pxeSrv := pxe.New(cfg.Services.PXE)
+		if cfg.Services.ExtrasFile != "" {
+			if extras, err := config.LoadExtras(cfg.Services.ExtrasFile); err == nil {
+				pxeSrv.SetMacImages(extras.MacImages)
+				if cfg.Services.PXE.MacImages == nil {
+					cfg.Services.PXE.MacImages = make(map[string]string)
+				}
+				for mac, img := range extras.MacImages {
+					cfg.Services.PXE.MacImages[mac] = img
+				}
+			}
+		}
+		go func() {
+			if err := pxeSrv.Start(); err != nil {
+				log.Printf("pxe: %v", err)
+			}
+		}()
+		activeServices = append(activeServices, fmt.Sprintf("PXE/TFTP(%s)", cfg.Services.PXE.Listen))
+	}
+
+	// 10. Start status HTTP API.
 	if mon != nil {
 		http.Handle("/status", mon)
 		go func() {
@@ -336,9 +383,14 @@ func main() {
 				log.Printf("status API: %v", err)
 			}
 		}()
+		activeServices = append(activeServices, "status:8080")
 	}
 
-	log.Printf("gokrazy-router running")
+	if len(activeServices) > 0 {
+		log.Printf("gokrazy-router running with active services: %s", strings.Join(activeServices, ", "))
+	} else {
+		log.Printf("gokrazy-router running")
+	}
 
 	// Wait for shutdown signal.
 	ch := make(chan os.Signal, 1)
@@ -347,6 +399,9 @@ func main() {
 	log.Printf("received %v, shutting down", sig)
 
 	// Cleanup.
+	if smbServer != nil {
+		_ = smbServer.Stop()
+	}
 	if wifiAP != nil {
 		wifiAP.Stop()
 	}
@@ -356,6 +411,28 @@ func main() {
 	if natMgr != nil {
 		natMgr.Cleanup()
 	}
+}
+
+func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string) {
+	if len(dhcpcfg.Reservations) > 0 {
+		srv.SetReservations(dhcpcfg.Reservations)
+	}
+	bootServer := dhcpcfg.PXEBootServer
+	bootFile := dhcpcfg.PXEBootFile
+	if pxeEnabled && bootServer == "" && tftpServer != "" {
+		bootServer = tftpServer
+	}
+	if bootServer != "" || bootFile != "" {
+		srv.SetPXEOptions(bootServer, bootFile)
+	}
+}
+
+func ifaceIPFromCIDR(cidr string) string {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil || ip.To4() == nil {
+		return ""
+	}
+	return ip.To4().String()
 }
 
 // assignIP assigns a CIDR address to the named interface and brings it up.

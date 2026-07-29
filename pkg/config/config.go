@@ -2,16 +2,21 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	WAN   WANConfig    `json:"wan"`
-	LAN   LANConfig    `json:"lan"`
-	VLANs []VLANConfig `json:"vlans,omitempty"`
-	NAT   NATConfig    `json:"nat"`
-	WiFi  WiFiConfig   `json:"wifi,omitempty"`
+	WAN      WANConfig      `json:"wan"`
+	LAN      LANConfig      `json:"lan"`
+	VLANs    []VLANConfig   `json:"vlans,omitempty"`
+	NAT      NATConfig      `json:"nat"`
+	WiFi     WiFiConfig     `json:"wifi,omitempty"`
+	Services ServicesConfig `json:"services,omitempty"`
 }
 
 type WANConfig struct {
@@ -27,11 +32,14 @@ type LANConfig struct {
 }
 
 type DHCPConfig struct {
-	Enabled       bool     `json:"enabled"`
-	RangeStart    string   `json:"rangeStart"`
-	RangeEnd      string   `json:"rangeEnd"`
-	LeaseDuration string   `json:"leaseDuration"`
-	DNS           []string `json:"dns"`
+	Enabled       bool              `json:"enabled"`
+	RangeStart    string            `json:"rangeStart"`
+	RangeEnd      string            `json:"rangeEnd"`
+	LeaseDuration string            `json:"leaseDuration"`
+	DNS           []string          `json:"dns"`
+	Reservations  map[string]string `json:"reservations,omitempty"` // MAC (lower case) -> IP
+	PXEBootServer string            `json:"pxeBootServer,omitempty"` // DHCP option 66
+	PXEBootFile   string            `json:"pxeBootFile,omitempty"`   // DHCP option 67
 }
 
 type VLANConfig struct {
@@ -66,6 +74,59 @@ type WiFiConfig struct {
 	WPA         int        `json:"wpa"`          // 2 for WPA2
 }
 
+// ServicesConfig groups optional add-on services that are not part of the core router.
+type ServicesConfig struct {
+	Mount      MountConfig  `json:"mount,omitempty"`
+	SMB        SMBConfig    `json:"smb,omitempty"`
+	PXE        PXEConfig    `json:"pxe,omitempty"`
+	ExtrasFile string       `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
+}
+
+// MountConfig describes a block device to mount before optional services start.
+type MountConfig struct {
+	Enabled bool   `json:"enabled"`
+	Device  string `json:"device"`  // e.g. /dev/sda1 or ${DISK_DEVICE}
+	FsType  string `json:"fsType"`  // e.g. ext4
+	Target  string `json:"target"`  // e.g. /mnt/data or ${DISK_TARGET}
+	Options string `json:"options"` // comma separated mount options, e.g. ${DISK_OPTS}
+}
+
+// SMBConfig starts an external smbd process to share the mounted volume.
+// Credentials and paths support ${ENV} expansion.
+type SMBConfig struct {
+	Enabled   bool   `json:"enabled"`
+	BinPath   string `json:"binPath,omitempty"`   // default: /usr/local/bin/smbd
+	Listen    string `json:"listen,omitempty"`    // default: 0.0.0.0:445
+	ShareName string `json:"shareName,omitempty"` // default: data
+	SharePath string `json:"sharePath,omitempty"` // default: mount target
+	User      string `json:"user,omitempty"`      // e.g. ${SMB_USER}
+	Password  string `json:"password,omitempty"`  // e.g. ${SMB_PASSWORD}
+}
+
+// PXEConfig starts a TFTP server and answers PXE boot requests.
+type PXEConfig struct {
+	Enabled      bool              `json:"enabled"`
+	Listen       string            `json:"listen,omitempty"`       // default: 0.0.0.0:69
+	TFTPRoot     string            `json:"tftpRoot,omitempty"`     // directory containing boot images
+	DefaultImage string            `json:"defaultImage,omitempty"` // filename used when MAC is unknown
+	MacImages    map[string]string `json:"macImages,omitempty"`    // MAC (lower case) -> filename
+	BootFile     string            `json:"bootFile,omitempty"`     // legacy option 67 value
+}
+
+// ExtrasConfig can be placed on the mounted volume and edited at runtime.
+// It is loaded after the JSON config and merged into the active configuration.
+type ExtrasConfig struct {
+	Reservations map[string]string `toml:"reservations"` // MAC -> IP
+	MacImages    map[string]string `toml:"macImages"`    // MAC -> PXE image filename
+	SMBUsers     []SMBUser         `toml:"smbUsers"`     // additional SMB users
+}
+
+// SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
+type SMBUser struct {
+	Name     string `toml:"name"`
+	Password string `toml:"password"`
+}
+
 func (d DHCPConfig) ParseLeaseDuration() time.Duration {
 	dur, err := time.ParseDuration(d.LeaseDuration)
 	if err != nil {
@@ -86,6 +147,77 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// LoadExtras reads optional TOML overrides from a file on the mounted volume.
+func LoadExtras(path string) (*ExtrasConfig, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var extras ExtrasConfig
+	if err := toml.NewDecoder(f).Decode(&extras); err != nil {
+		return nil, fmt.Errorf("decode extras TOML: %w", err)
+	}
+	return &extras, nil
+}
+
+// ExpandEnv replaces ${VAR} and $VAR in strings inside the config.
+// Call after loading and after any disk mount so that paths are known.
+func (c *Config) ExpandEnv() {
+	e := os.ExpandEnv
+	c.Services.Mount.Device = e(c.Services.Mount.Device)
+	c.Services.Mount.Target = e(c.Services.Mount.Target)
+	c.Services.Mount.FsType = e(c.Services.Mount.FsType)
+	c.Services.Mount.Options = e(c.Services.Mount.Options)
+
+	c.Services.SMB.BinPath = e(c.Services.SMB.BinPath)
+	c.Services.SMB.Listen = e(c.Services.SMB.Listen)
+	c.Services.SMB.ShareName = e(c.Services.SMB.ShareName)
+	c.Services.SMB.SharePath = e(c.Services.SMB.SharePath)
+	c.Services.SMB.User = e(c.Services.SMB.User)
+	c.Services.SMB.Password = e(c.Services.SMB.Password)
+
+	c.Services.PXE.Listen = e(c.Services.PXE.Listen)
+	c.Services.PXE.TFTPRoot = e(c.Services.PXE.TFTPRoot)
+	c.Services.PXE.DefaultImage = e(c.Services.PXE.DefaultImage)
+	c.Services.PXE.BootFile = e(c.Services.PXE.BootFile)
+	for k, v := range c.Services.PXE.MacImages {
+		c.Services.PXE.MacImages[k] = e(v)
+	}
+
+	c.Services.ExtrasFile = e(c.Services.ExtrasFile)
+}
+
+// ApplyExtras merges ExtrasConfig into the loaded config.
+func (c *Config) ApplyExtras(extras *ExtrasConfig) {
+	if extras == nil {
+		return
+	}
+	for mac, ip := range extras.Reservations {
+		if c.LAN.DHCP.Reservations == nil {
+			c.LAN.DHCP.Reservations = make(map[string]string)
+		}
+		c.LAN.DHCP.Reservations[normalizeMAC(mac)] = ip
+		for i := range c.VLANs {
+			if c.VLANs[i].DHCP.Reservations == nil {
+				c.VLANs[i].DHCP.Reservations = make(map[string]string)
+			}
+			c.VLANs[i].DHCP.Reservations[normalizeMAC(mac)] = ip
+		}
+	}
+	for mac, img := range extras.MacImages {
+		if c.Services.PXE.MacImages == nil {
+			c.Services.PXE.MacImages = make(map[string]string)
+		}
+		c.Services.PXE.MacImages[normalizeMAC(mac)] = img
+	}
+}
+
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mac, "-", ":")))
 }
 
 func Default() *Config {

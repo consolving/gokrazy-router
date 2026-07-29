@@ -42,10 +42,10 @@ func TestLeaseExpiry(t *testing.T) {
 	s.leases[mac] = l
 	s.mu.Unlock()
 
-	// Verify isLeased returns false for expired lease.
+	// Verify isLeasedOrReserved returns false for expired lease.
 	s.mu.Lock()
-	if s.isLeased(ip) {
-		t.Fatal("expired lease should not be considered leased")
+	if s.isLeasedOrReserved(ip) {
+		t.Fatal("expired lease should not be considered leased or reserved")
 	}
 	s.mu.Unlock()
 }

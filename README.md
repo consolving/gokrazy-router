@@ -13,6 +13,11 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
 - **Status CLI** — `gokrazy-router-status` queries the API and prints port/client tables
+- **Disk mount** — Mount a block device via environment variables for use by SMB/PXE/extras config
+- **SMB server** — Share the mounted disk via an externally bundled `smbd`, with user/password from environment variables
+- **PXE/TFTP server** — Serve boot images to PXE clients, with per-MAC image selection and a default fallback
+- **Static DHCP reservations** — Pin a MAC address to a fixed IP address
+- **Runtime extras config** — Place an editable TOML file on the mounted disk; changes take effect on the next gokrazy restart
 
 ## Hardware
 
@@ -119,6 +124,118 @@ When the `vlans` array is empty or omitted, all LAN ports are bridged into a sin
 - **Routed** (default): `wlan0` gets its own subnet. A separate DHCP server runs on `wlan0`. The RTL8192CU does not support bridged AP mode (data frames are not forwarded), so routed mode is required.
 - **Shared subnet with LAN**: Split a /24 into two /25 subnets — one for WiFi, one for a LAN port. The router forwards between them. See VLAN 31 in the example above.
 
+## Optional services
+
+The `services` section enables disk mounting, SMB, PXE/TFTP and static DHCP reservations.
+
+### Disk mount
+
+Mount a block device before the optional services start. Values support `${ENV}` expansion.
+
+```json
+"services": {
+  "mount": {
+    "enabled": true,
+    "device": "${DISK_DEVICE}",
+    "fsType": "ext4",
+    "target": "${DISK_TARGET}",
+    "options": "${DISK_OPTS}"
+  }
+}
+```
+
+Set the environment variables in your `config.json` `PackageConfig`:
+
+```json
+"CommandLineFlags": ["-config=/etc/gokrazy-router.json"],
+"Environment": [
+  "DISK_DEVICE=/dev/sda1",
+  "DISK_TARGET=/mnt/data",
+  "DISK_OPTS=defaults,noatime"
+]
+```
+
+### SMB share
+
+Share the mounted volume via SMB. The credentials use `${ENV}` expansion so they are not stored in the JSON config.
+
+```json
+"smb": {
+  "enabled": true,
+  "binPath": "/usr/local/bin/smbd",
+  "listen": "0.0.0.0:445",
+  "shareName": "data",
+  "sharePath": "/mnt/data",
+  "user": "${SMB_USER}",
+  "password": "${SMB_PASSWORD}"
+}
+```
+
+A statically linked `smbd` (and `smbpasswd`) must be bundled via ExtraFilePaths, just like `hostapd`.
+
+### PXE/TFTP server
+
+Serve boot images to PXE clients. The `tftpRoot` defaults to `<mountTarget>/tftpboot`.
+
+```json
+"pxe": {
+  "enabled": true,
+  "listen": "0.0.0.0:69",
+  "tftpRoot": "/mnt/data/tftpboot",
+  "defaultImage": "ipxe-default.efi",
+  "macImages": {
+    "aa:bb:cc:dd:ee:ff": "ipxe-workstation.efi"
+  }
+}
+```
+
+DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. If `pxeBootServer`/`pxeBootFile` are set on a DHCP block, those values are used instead.
+
+### Static DHCP reservations
+
+Reserve fixed IPs by MAC address in any `dhcp` block:
+
+```json
+"dhcp": {
+  "enabled": true,
+  "rangeStart": "10.0.1.100",
+  "rangeEnd": "10.0.1.250",
+  "reservations": {
+    "aa:bb:cc:dd:ee:ff": "10.0.1.10",
+    "11:22:33:44:55:66": "10.0.1.11"
+  }
+}
+```
+
+### Runtime extras config
+
+You can place a TOML file on the mounted disk and edit it with a text editor. The file is re-read on every gokrazy restart, so changes take effect when you restart the router service from the web UI.
+
+Example `/mnt/data/router-extras.toml`:
+
+```toml
+[reservations]
+"aa:bb:cc:dd:ee:ff" = "10.0.1.10"
+"11:22:33:44:55:66" = "10.0.1.11"
+
+[macImages]
+"aa:bb:cc:dd:ee:ff" = "ipxe-workstation.efi"
+
+[[smbUsers]]
+name = "backup"
+password = "secret"
+```
+
+Point the JSON config at it:
+
+```json
+"services": {
+  "extrasFile": "/mnt/data/router-extras.toml"
+}
+```
+
+A startup log line prints all active services, including extras-driven reservations and PXE images.
+
 ## Deployment
 
 Add to your gokrazy instance config:
@@ -131,17 +248,25 @@ Add to your gokrazy instance config:
   "PackageConfig": {
     "github.com/consolving/gokrazy-router/cmd/gokrazy-router": {
       "ExtraFilePaths": {
-        "/usr/local/bin/hostapd": "hostapd-armv7-static"
+        "/usr/local/bin/hostapd": "hostapd-armv7-static",
+        "/usr/local/bin/smbd": "smbd-armv7-static",
+        "/usr/local/bin/smbpasswd": "smbpasswd-armv7-static"
       },
       "ExtraFileContents": {
         "/etc/gokrazy-router.json": "<your JSON config here>"
-      }
+      },
+      "Environment": [
+        "DISK_DEVICE=/dev/sda1",
+        "DISK_TARGET=/mnt/data",
+        "SMB_USER=files",
+        "SMB_PASSWORD=changeme"
+      ]
     }
   }
 }
 ```
 
-The `hostapd` binary must be statically compiled for ARMv7. Use `build-hostapd.sh` to cross-compile it via Docker.
+The `hostapd` and `smbd` binaries must be statically compiled for ARMv7. Use `build-hostapd.sh` and/or `build-samba.sh` to cross-compile them via Docker. Omit the Samba binaries if you do not enable SMB.
 
 ## Building locally
 
@@ -198,6 +323,7 @@ The columns show:
 | `github.com/vishvananda/netlink` | Bridge, interface, address management |
 | `github.com/google/nftables` | NAT masquerade + isolation rules + traffic counters |
 | `github.com/insomniacslk/dhcp` | DHCPv4 server |
-| `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping file parsing |
+| `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping and runtime extras config parsing |
+| `github.com/pin/tftp/v3` | TFTP server for PXE boot |
 
-External: `hostapd` (statically compiled, bundled via gokrazy ExtraFilePaths)
+External: `hostapd` and optionally `smbd`/`smbpasswd` (statically compiled, bundled via gokrazy ExtraFilePaths)

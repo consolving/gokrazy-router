@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,9 @@ type Server struct {
 	mu             sync.Mutex
 	leases         map[string]lease // MAC -> lease
 	nextIP         net.IP
+	reservations   map[string]net.IP // normalized MAC -> IP
+	pxeBootServer  net.IP
+	pxeBootFile    string
 	onLease        LeaseCallback
 	onLeaseExpired LeaseExpiredCallback
 }
@@ -42,6 +46,12 @@ type Server struct {
 type lease struct {
 	IP      net.IP
 	Expires time.Time
+}
+
+// Reservation describes optional static lease and PXE overrides for a MAC address.
+type Reservation struct {
+	IP          string
+	PXEBootFile string // optional per-client PXE boot file
 }
 
 // New creates a DHCP server. serverAddr is in CIDR notation (e.g. "10.0.0.1/24").
@@ -89,6 +99,38 @@ func (s *Server) OnLease(cb LeaseCallback) {
 // OnLeaseExpired registers a callback for lease expirations.
 func (s *Server) OnLeaseExpired(cb LeaseExpiredCallback) {
 	s.onLeaseExpired = cb
+}
+
+// SetReservations replaces the static MAC -> IP reservation map.
+// MAC addresses are normalized to lower-case xx:xx:xx:xx:xx:xx.
+func (s *Server) SetReservations(reservations map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reservations = make(map[string]net.IP, len(reservations))
+	for mac, ip := range reservations {
+		parsed := net.ParseIP(ip).To4()
+		if parsed == nil {
+			continue
+		}
+		s.reservations[normalizeMAC(mac)] = parsed
+	}
+}
+
+// SetPXEOptions configures DHCP option 66 (TFTP server) and 67 (boot file).
+func (s *Server) SetPXEOptions(bootServer string, bootFile string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pxeBootServer = nil
+	if bootServer != "" {
+		if ip := net.ParseIP(bootServer).To4(); ip != nil {
+			s.pxeBootServer = ip
+		}
+	}
+	s.pxeBootFile = bootFile
+}
+
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mac, "-", ":")))
 }
 
 // Run starts the DHCP server. It blocks until an error occurs.
@@ -195,6 +237,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 
 	var resp *dhcpv4.DHCPv4
 	var err error
+	opts := s.replyOptions(mac)
 
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover:
@@ -208,6 +251,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
 			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
+			opts,
 		)
 	case dhcpv4.MessageTypeRequest:
 		ip := s.allocate(mac)
@@ -220,6 +264,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
 			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
+			opts,
 		)
 		log.Printf("dhcp: ACK %s -> %s", mac, ip)
 	default:
@@ -250,6 +295,19 @@ func (s *Server) allocate(mac string) net.IP {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	normalized := normalizeMAC(mac)
+
+	// Honor static reservation first.
+	if reserved, ok := s.reservations[normalized]; ok {
+		// Ensure an expired dynamic lease for that IP is not handed out to someone else.
+		s.clearLeasesForIP(reserved)
+		s.leases[mac] = lease{IP: dupIP(reserved), Expires: time.Now().Add(s.lease)}
+		if s.onLease != nil {
+			go s.onLease(dupIP(reserved), mac)
+		}
+		return reserved
+	}
+
 	// Return existing lease if valid.
 	if l, ok := s.leases[mac]; ok && time.Now().Before(l.Expires) {
 		return l.IP
@@ -258,7 +316,7 @@ func (s *Server) allocate(mac string) net.IP {
 	// Find next free IP.
 	ip := dupIP(s.nextIP)
 	for {
-		if !s.isLeased(ip) {
+		if !s.isLeasedOrReserved(ip) {
 			break
 		}
 		ip = incIP(ip)
@@ -282,13 +340,42 @@ func (s *Server) allocate(mac string) net.IP {
 	return ip
 }
 
-func (s *Server) isLeased(ip net.IP) bool {
+func (s *Server) isLeasedOrReserved(ip net.IP) bool {
+	for _, reserved := range s.reservations {
+		if reserved.Equal(ip) {
+			return true
+		}
+	}
 	for _, l := range s.leases {
 		if l.IP.Equal(ip) && time.Now().Before(l.Expires) {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *Server) clearLeasesForIP(ip net.IP) {
+	for mac, l := range s.leases {
+		if l.IP.Equal(ip) {
+			delete(s.leases, mac)
+		}
+	}
+}
+
+func (s *Server) replyOptions(mac string) dhcpv4.Modifier {
+	return func(d *dhcpv4.DHCPv4) {
+		s.mu.Lock()
+		bootServer := s.pxeBootServer
+		bootFile := s.pxeBootFile
+		s.mu.Unlock()
+
+		if bootServer != nil {
+			d.UpdateOption(dhcpv4.OptTFTPServerName(bootServer.String()))
+		}
+		if bootFile != "" {
+			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
+		}
+	}
 }
 
 func dupIP(ip net.IP) net.IP {
