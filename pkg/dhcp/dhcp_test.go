@@ -149,3 +149,71 @@ func TestAllocateReusesExpiredLease(t *testing.T) {
 		t.Fatalf("expected 10.0.0.100 (reused), got %s", ip2)
 	}
 }
+
+func TestSetReservationsAndAllocate(t *testing.T) {
+	s := &Server{
+		iface:      "eth0",
+		serverIP:   net.ParseIP("10.0.0.1").To4(),
+		mask:       net.CIDRMask(24, 32),
+		rangeStart: net.ParseIP("10.0.0.100").To4(),
+		rangeEnd:   net.ParseIP("10.0.0.200").To4(),
+		dns:        []net.IP{net.ParseIP("8.8.8.8").To4()},
+		lease:      1 * time.Hour,
+		router:     net.ParseIP("10.0.0.1").To4(),
+		leases:     make(map[string]lease),
+		nextIP:     dupIP(net.ParseIP("10.0.0.100").To4()),
+	}
+
+	s.SetReservations(map[string]string{
+		"AA-BB-CC-DD-EE-FF": "10.0.0.50",
+	})
+
+	ip := s.allocate("aa:bb:cc:dd:ee:ff")
+	if ip.String() != "10.0.0.50" {
+		t.Fatalf("expected reserved 10.0.0.50, got %s", ip)
+	}
+
+	// A non-reserved client should skip the reserved IP.
+	ip2 := s.allocate("00:11:22:33:44:55")
+	if ip2.String() == "10.0.0.50" {
+		t.Fatal("dynamic client got reserved IP")
+	}
+}
+
+func TestSetPXEOptions(t *testing.T) {
+	s := &Server{
+		iface:    "eth0",
+		serverIP: net.ParseIP("10.0.0.1").To4(),
+		mask:     net.CIDRMask(24, 32),
+	}
+	s.SetPXEOptions("10.0.0.2", "pxelinux.0")
+
+	s.mu.Lock()
+	got := s.pxeBootServer.String()
+	file := s.pxeBootFile
+	s.mu.Unlock()
+
+	if got != "10.0.0.2" {
+		t.Errorf("pxeBootServer = %q, want 10.0.0.2", got)
+	}
+	if file != "pxelinux.0" {
+		t.Errorf("pxeBootFile = %q, want pxelinux.0", file)
+	}
+}
+
+func TestNormalizeMAC(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"AA:BB:CC:DD:EE:FF", "aa:bb:cc:dd:ee:ff"},
+		{"aa-bb-cc-dd-ee-ff", "aa:bb:cc:dd:ee:ff"},
+		{"  AA:BB:CC:DD:EE:FF  ", "aa:bb:cc:dd:ee:ff"},
+	}
+	for _, c := range cases {
+		got := normalizeMAC(c.in)
+		if got != c.want {
+			t.Errorf("normalizeMAC(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

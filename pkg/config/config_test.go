@@ -125,3 +125,119 @@ func TestLoadInvalidJSON(t *testing.T) {
 		t.Error("Load() should fail for invalid JSON")
 	}
 }
+
+func TestExpandEnv(t *testing.T) {
+	t.Setenv("DISK_DEVICE", "/dev/sda1")
+	t.Setenv("DISK_TARGET", "/mnt/data")
+	t.Setenv("SMB_USER", "alice")
+	t.Setenv("TFTP_ROOT", "/tftpboot")
+
+	cfg := &Config{
+		Services: ServicesConfig{
+			Mount: MountConfig{
+				Device: "${DISK_DEVICE}",
+				Target: "${DISK_TARGET}",
+			},
+			SMB: SMBConfig{
+				User: "${SMB_USER}",
+			},
+			PXE: PXEConfig{
+				TFTPRoot: "${TFTP_ROOT}",
+				MacImages: map[string]string{
+					"aa:bb:cc:dd:ee:ff": "${TFTP_ROOT}/img.bin",
+				},
+			},
+		},
+	}
+	cfg.ExpandEnv()
+
+	if cfg.Services.Mount.Device != "/dev/sda1" {
+		t.Errorf("Mount.Device = %q, want /dev/sda1", cfg.Services.Mount.Device)
+	}
+	if cfg.Services.Mount.Target != "/mnt/data" {
+		t.Errorf("Mount.Target = %q, want /mnt/data", cfg.Services.Mount.Target)
+	}
+	if cfg.Services.SMB.User != "alice" {
+		t.Errorf("SMB.User = %q, want alice", cfg.Services.SMB.User)
+	}
+	if cfg.Services.PXE.TFTPRoot != "/tftpboot" {
+		t.Errorf("PXE.TFTPRoot = %q, want /tftpboot", cfg.Services.PXE.TFTPRoot)
+	}
+	if cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"] != "/tftpboot/img.bin" {
+		t.Errorf("PXE.MacImages expanded = %q, want /tftpboot/img.bin", cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"])
+	}
+}
+
+func TestLoadExtras(t *testing.T) {
+	tomlData := `
+reservations = { "AA-BB-CC-DD-EE-FF" = "10.0.0.50", "00:11:22:33:44:55" = "10.0.0.51" }
+macImages = { "AA-BB-CC-DD-EE-FF" = "netboot-arm.bin" }
+
+[[smbUsers]]
+name = "bob"
+password = "secret"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "extras.toml")
+	if err := os.WriteFile(path, []byte(tomlData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	extras, err := LoadExtras(path)
+	if err != nil {
+		t.Fatalf("LoadExtras() error: %v", err)
+	}
+	if extras.Reservations["AA-BB-CC-DD-EE-FF"] != "10.0.0.50" {
+		t.Errorf("reservation = %q, want 10.0.0.50", extras.Reservations["AA-BB-CC-DD-EE-FF"])
+	}
+	if extras.MacImages["AA-BB-CC-DD-EE-FF"] != "netboot-arm.bin" {
+		t.Errorf("mac image = %q, want netboot-arm.bin", extras.MacImages["AA-BB-CC-DD-EE-FF"])
+	}
+	if len(extras.SMBUsers) != 1 || extras.SMBUsers[0].Name != "bob" {
+		t.Errorf("SMB users = %+v, want [bob]", extras.SMBUsers)
+	}
+}
+
+func TestApplyExtras(t *testing.T) {
+	cfg := Default()
+	cfg.Services.PXE.MacImages = map[string]string{
+		"00:00:00:00:00:00": "fallback.bin",
+	}
+
+	extras := &ExtrasConfig{
+		Reservations: map[string]string{
+			"AA-BB-CC-DD-EE-FF": "10.0.0.50",
+		},
+		MacImages: map[string]string{
+			"AA-BB-CC-DD-EE-FF": "netboot-arm.bin",
+		},
+	}
+	cfg.ApplyExtras(extras)
+
+	if cfg.LAN.DHCP.Reservations["aa:bb:cc:dd:ee:ff"] != "10.0.0.50" {
+		t.Errorf("LAN reservation = %v", cfg.LAN.DHCP.Reservations)
+	}
+	if cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"] != "netboot-arm.bin" {
+		t.Errorf("PXE mac image = %v", cfg.Services.PXE.MacImages)
+	}
+	if cfg.Services.PXE.MacImages["00:00:00:00:00:00"] != "fallback.bin" {
+		t.Error("existing PXE mac image overwritten")
+	}
+}
+
+func TestNormalizeMAC(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"AA:BB:CC:DD:EE:FF", "aa:bb:cc:dd:ee:ff"},
+		{"aa-bb-cc-dd-ee-ff", "aa:bb:cc:dd:ee:ff"},
+		{"  AA:BB:CC:DD:EE:FF  ", "aa:bb:cc:dd:ee:ff"},
+	}
+	for _, c := range cases {
+		got := normalizeMAC(c.in)
+		if got != c.want {
+			t.Errorf("normalizeMAC(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
