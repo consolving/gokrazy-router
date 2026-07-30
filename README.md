@@ -13,7 +13,7 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
 - **Netboot service** — Per-VLAN PXE (TFTP) and HTTP boot server. DHCP automatically injects boot options for legacy PXE, iPXE, and UEFI HTTP Boot clients. Serve kernels, initrds, and boot scripts from a configurable boot directory.
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
-- **Status CLI** — `gokrazy-router-status` queries the API and prints port/client tables
+- **Status CLI** — `router-cli` queries the API and prints port/client tables
 - **Disk mount** — Mount a block device via environment variables for use by SMB/PXE/extras config
 - **SMB server** — Share the mounted disk via an externally bundled `smbd`, with user/password from environment variables
 - **PXE/TFTP server** — Serve boot images to PXE clients, with per-MAC image selection and a default fallback
@@ -296,15 +296,15 @@ See [`netboot/gokrazy-router.json`](netboot/gokrazy-router.json) for a complete 
 go build ./cmd/gokrazy-router/
 
 # Status CLI
-go build ./cmd/gokrazy-router-status/
+go build ./cmd/router-cli/
 
 # Cross-compile for BananaPi R1 (ARMv7)
 GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/gokrazy-router/
-GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/grcli/
+GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/router-cli/
 
 # Build for amd64 (e.g. x86 router or VM)
 GOOS=linux GOARCH=amd64 go build ./cmd/gokrazy-router/
-GOOS=linux GOARCH=amd64 go build ./cmd/grcli/
+GOOS=linux GOARCH=amd64 go build ./cmd/router-cli/
 
 # Cross-compile hostapd
 ./build-hostapd.sh
@@ -319,8 +319,8 @@ The daemon serves a JSON status endpoint at `http://<router-ip>:8080/status` wit
 Use the CLI tool to query it:
 
 ```bash
-gokrazy-router-status --host 10.0.31.1
-gokrazy-router-status --host 10.0.31.1 --json
+router-cli --host 10.0.31.1
+router-cli --host 10.0.31.1 --json
 ```
 
 Example output:

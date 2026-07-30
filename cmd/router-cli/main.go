@@ -1,4 +1,4 @@
-// Command gokrazy-router-status queries the router's status API and displays
+// Command router-cli queries the router's status API and displays
 // port link states and per-client traffic counters.
 //
 // It can also export the list of known MAC addresses as a TOML file for
