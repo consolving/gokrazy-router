@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -40,7 +41,7 @@ type DHCPConfig struct {
 	RangeEnd      string            `json:"rangeEnd"`
 	LeaseDuration string            `json:"leaseDuration"`
 	DNS           []string          `json:"dns"`
-	Reservations  map[string]string `json:"reservations,omitempty"` // MAC (lower case) -> IP
+	Reservations  map[string]string `json:"reservations,omitempty"`  // MAC (lower case) -> IP
 	PXEBootServer string            `json:"pxeBootServer,omitempty"` // DHCP option 66
 	PXEBootFile   string            `json:"pxeBootFile,omitempty"`   // DHCP option 67
 }
@@ -64,25 +65,25 @@ type WiFiConfig struct {
 	Enabled     bool       `json:"enabled"`
 	Interface   string     `json:"interface"`
 	Bridge      string     `json:"bridge"`      // if empty, wlan0 gets its own subnet
-	Address     string     `json:"address"`      // CIDR for wlan0 when not bridged, e.g. "10.0.1.1/24"
-	DHCP        DHCPConfig `json:"dhcp"`         // DHCP pool for WiFi clients (when not bridged)
-	MacMapFile  string     `json:"macMapFile"`   // path to MAC-to-VLAN TOML mapping file
-	DefaultVLAN int        `json:"defaultVlan"`  // VLAN for WiFi clients not in the map (0 = use macmap default)
+	Address     string     `json:"address"`     // CIDR for wlan0 when not bridged, e.g. "10.0.1.1/24"
+	DHCP        DHCPConfig `json:"dhcp"`        // DHCP pool for WiFi clients (when not bridged)
+	MacMapFile  string     `json:"macMapFile"`  // path to MAC-to-VLAN TOML mapping file
+	DefaultVLAN int        `json:"defaultVlan"` // VLAN for WiFi clients not in the map (0 = use macmap default)
 	SSID        string     `json:"ssid"`
 	Passphrase  string     `json:"passphrase"`
 	Channel     int        `json:"channel"`
-	HWMode      string     `json:"hwMode"`       // "g" for 2.4GHz, "a" for 5GHz
-	HTCapab     string     `json:"htCapab"`      // e.g. "[HT40+][SHORT-GI-20]"
+	HWMode      string     `json:"hwMode"`  // "g" for 2.4GHz, "a" for 5GHz
+	HTCapab     string     `json:"htCapab"` // e.g. "[HT40+][SHORT-GI-20]"
 	CountryCode string     `json:"countryCode"`
-	WPA         int        `json:"wpa"`          // 2 for WPA2
+	WPA         int        `json:"wpa"` // 2 for WPA2
 }
 
 // ServicesConfig groups optional add-on services that are not part of the core router.
 type ServicesConfig struct {
-	Mount      MountConfig  `json:"mount,omitempty"`
-	SMB        SMBConfig    `json:"smb,omitempty"`
-	PXE        PXEConfig    `json:"pxe,omitempty"`
-	ExtrasFile string       `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
+	Mount      MountConfig `json:"mount,omitempty"`
+	SMB        SMBConfig   `json:"smb,omitempty"`
+	PXE        PXEConfig   `json:"pxe,omitempty"`
+	ExtrasFile string      `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
 }
 
 // MountConfig describes a block device to mount before optional services start.
@@ -97,34 +98,36 @@ type MountConfig struct {
 // SMBConfig starts an external smbd process to share the mounted volume.
 // Credentials and paths support ${ENV} expansion.
 type SMBConfig struct {
-	Enabled             bool   `json:"enabled"`
-	BinPath             string `json:"binPath,omitempty"`             // default: /usr/local/bin/smbd
-	Listen              string `json:"listen,omitempty"`              // default: 0.0.0.0:445
-	ShareName           string `json:"shareName,omitempty"`           // default: data
-	SharePath           string `json:"sharePath,omitempty"`           // default: mount target
-	User                string `json:"user,omitempty"`                // e.g. ${SMB_USER}
-	Password            string `json:"password,omitempty"`            // e.g. ${SMB_PASSWORD}
-	UsePortableServer   bool   `json:"usePortableServer,omitempty"`   // use fiddyschmitt/portable-smb-server instead of Samba smbd
+	Enabled           bool   `json:"enabled"`
+	BinPath           string `json:"binPath,omitempty"`           // default: /usr/local/bin/smbd
+	Listen            string `json:"listen,omitempty"`            // default: 0.0.0.0:445
+	ShareName         string `json:"shareName,omitempty"`         // default: data
+	SharePath         string `json:"sharePath,omitempty"`         // default: mount target
+	User              string `json:"user,omitempty"`              // e.g. ${SMB_USER}
+	Password          string `json:"password,omitempty"`          // e.g. ${SMB_PASSWORD}
+	UsePortableServer bool   `json:"usePortableServer,omitempty"` // use fiddyschmitt/portable-smb-server instead of Samba smbd
 }
 
 // PXEConfig starts a TFTP server and answers PXE boot requests.
 type PXEConfig struct {
-	Enabled      bool              `json:"enabled"`
-	Listen       string            `json:"listen,omitempty"`       // default: 0.0.0.0:69
-	TFTPRoot     string            `json:"tftpRoot,omitempty"`     // directory containing boot images
-	DefaultImage string            `json:"defaultImage,omitempty"` // filename used when MAC is unknown
-	MacImages    map[string]string `json:"macImages,omitempty"`    // MAC (lower case) -> filename
-	BootFile     string            `json:"bootFile,omitempty"`     // legacy option 67 value
+	Enabled       bool              `json:"enabled"`
+	Listen        string            `json:"listen,omitempty"`        // default: 0.0.0.0:69
+	BindInterface string            `json:"bindInterface,omitempty"` // SO_BINDTODEVICE target interface (e.g., br-vlan31)
+	TFTPRoot      string            `json:"tftpRoot,omitempty"`      // directory containing boot images
+	DefaultImage  string            `json:"defaultImage,omitempty"`  // filename used when MAC is unknown
+	MacImages     map[string]string `json:"macImages,omitempty"`     // MAC (lower case) -> filename
+	BootFile      string            `json:"bootFile,omitempty"`      // legacy option 67 value
 }
 
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations  map[string]string `toml:"reservations"`   // MAC -> IP
-	MacImages     map[string]string `toml:"macImages"`      // MAC -> PXE image filename
-	DefaultImage  string            `toml:"defaultImage"`   // PXE default image (overrides router.json)
-	PXEBootFile   string            `toml:"pxeBootFile"`    // DHCP option 67 bootfile (applied to all subnets)
-	SMBUsers      []SMBUser         `toml:"smbUsers"`       // additional SMB users
+	Reservations  map[string]string `toml:"reservations"`            // MAC -> IP
+	MacImages     map[string]string `toml:"macImages"`               // MAC -> PXE image filename
+	DefaultImage  string            `toml:"defaultImage"`            // PXE default image (overrides router.json)
+	PXEBootFile   string            `toml:"pxeBootFile"`             // DHCP option 67 bootfile (applied to all subnets)
+	SMBUsers      []SMBUser         `toml:"smbUsers"`                // additional SMB users
+	VLANAddresses map[int]string    `toml:"vlanAddresses,omitempty"` // VLAN ID -> CIDR address override
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -271,15 +274,29 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 		return
 	}
 	for mac, ip := range extras.Reservations {
-		if c.LAN.DHCP.Reservations == nil {
-			c.LAN.DHCP.Reservations = make(map[string]string)
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			continue
 		}
-		c.LAN.DHCP.Reservations[normalizeMAC(mac)] = ip
-		for i := range c.VLANs {
-			if c.VLANs[i].DHCP.Reservations == nil {
-				c.VLANs[i].DHCP.Reservations = make(map[string]string)
+		parsedIP = parsedIP.To4()
+		if parsedIP == nil {
+			continue
+		}
+		if c.LAN.Address != "" {
+			if _, subnet, err := net.ParseCIDR(c.LAN.Address); err == nil && subnet.Contains(parsedIP) {
+				if c.LAN.DHCP.Reservations == nil {
+					c.LAN.DHCP.Reservations = make(map[string]string)
+				}
+				c.LAN.DHCP.Reservations[normalizeMAC(mac)] = ip
 			}
-			c.VLANs[i].DHCP.Reservations[normalizeMAC(mac)] = ip
+		}
+		for i := range c.VLANs {
+			if _, subnet, err := net.ParseCIDR(c.VLANs[i].Address); err == nil && subnet.Contains(parsedIP) {
+				if c.VLANs[i].DHCP.Reservations == nil {
+					c.VLANs[i].DHCP.Reservations = make(map[string]string)
+				}
+				c.VLANs[i].DHCP.Reservations[normalizeMAC(mac)] = ip
+			}
 		}
 	}
 	for mac, img := range extras.MacImages {
@@ -298,6 +315,49 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 		c.WiFi.DHCP.PXEBootFile = extras.PXEBootFile
 		c.LAN.DHCP.PXEBootFile = extras.PXEBootFile
 	}
+	for id, addr := range extras.VLANAddresses {
+		for i := range c.VLANs {
+			if c.VLANs[i].ID == id {
+				c.VLANs[i].Address = addr
+				break
+			}
+		}
+	}
+}
+
+// ExtrasFromConfig populates an ExtrasConfig from the current Config.
+// Used to initialise the extras TOML file when none exists.
+func ExtrasFromConfig(c *Config) *ExtrasConfig {
+	e := &ExtrasConfig{}
+	e.Reservations = make(map[string]string)
+	for _, v := range c.VLANs {
+		for mac, ip := range v.DHCP.Reservations {
+			e.Reservations[mac] = ip
+		}
+	}
+	for mac, ip := range c.LAN.DHCP.Reservations {
+		e.Reservations[mac] = ip
+	}
+	for mac, ip := range c.WiFi.DHCP.Reservations {
+		e.Reservations[mac] = ip
+	}
+
+	e.MacImages = make(map[string]string)
+	for mac, img := range c.Services.PXE.MacImages {
+		e.MacImages[mac] = img
+	}
+	e.DefaultImage = c.Services.PXE.DefaultImage
+	for _, v := range c.VLANs {
+		if v.DHCP.PXEBootFile != "" {
+			e.PXEBootFile = v.DHCP.PXEBootFile
+			break
+		}
+	}
+	e.VLANAddresses = make(map[int]string)
+	for _, v := range c.VLANs {
+		e.VLANAddresses[v.ID] = v.Address
+	}
+	return e
 }
 
 func normalizeMAC(mac string) string {

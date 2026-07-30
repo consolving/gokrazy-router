@@ -168,6 +168,13 @@ func main() {
 		log.Printf("status monitor: %v (continuing without)", err)
 	}
 
+	// Collect running services for config reload.
+	type dhcpEntry struct {
+		srv      *dhcp.Server
+		tftpAddr string
+	}
+	var dhcpEntries []dhcpEntry
+
 	var activeServices []string
 
 	// 5. Start WiFi AP (hostapd).
@@ -250,7 +257,8 @@ func main() {
 			if err != nil {
 				log.Fatalf("dhcp vlan %d: %v", vc.ID, err)
 			}
-			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address))
+			dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(vc.Address)})
+			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address), cfg.Services.PXE.MacImages)
 			if mon != nil {
 				vlanName := vc.Name
 				if vlanName == "" {
@@ -288,7 +296,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp: %v", err)
 		}
-		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address))
+		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.LAN.Address)})
+		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address), cfg.Services.PXE.MacImages)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "L"); err != nil {
@@ -322,7 +331,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp wifi: %v", err)
 		}
-		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address))
+		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.WiFi.Address)})
+		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address), cfg.Services.PXE.MacImages)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "W"); err != nil {
@@ -362,8 +372,14 @@ func main() {
 	}
 
 	// 9. Start optional PXE/TFTP server.
+	// Default to 0.0.0.0:69, but bind the socket to the PXE VLAN bridge so
+	// TFTP replies leave through the correct interface (matches DHCP server).
+	if cfg.Services.PXE.Enabled && vlanMode && len(cfg.VLANs) > 0 && cfg.Services.PXE.BindInterface == "" {
+		cfg.Services.PXE.BindInterface = vlan.BridgeName(cfg.VLANs[len(cfg.VLANs)-1].ID)
+	}
+	var pxeSrv *pxe.Server
 	if cfg.Services.PXE.Enabled {
-		pxeSrv := pxe.New(cfg.Services.PXE)
+		pxeSrv = pxe.New(cfg.Services.PXE)
 		if cfg.Services.ExtrasFile != "" {
 			if extras, err := config.LoadExtras(cfg.Services.ExtrasFile); err == nil {
 				pxeSrv.SetMacImages(extras.MacImages)
@@ -372,6 +388,9 @@ func main() {
 				}
 				for mac, img := range extras.MacImages {
 					cfg.Services.PXE.MacImages[mac] = img
+				}
+				if extras.DefaultImage != "" {
+					pxeSrv.SetDefaultImage(extras.DefaultImage)
 				}
 			}
 		}
@@ -383,18 +402,75 @@ func main() {
 		activeServices = append(activeServices, fmt.Sprintf("PXE/TFTP(%s)", cfg.Services.PXE.Listen))
 	}
 
-	// 10. Start status HTTP API.
+	// 10. Start administration HTTP API.
 	if mon != nil {
 		http.Handle("/status", mon)
-		go func() {
-			addr := ":8080"
-			log.Printf("status API listening on %s", addr)
-			if err := http.ListenAndServe(addr, nil); err != nil {
-				log.Printf("status API: %v", err)
-			}
-		}()
-		activeServices = append(activeServices, "status:8080")
 	}
+	http.HandleFunc("/api/reload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "use POST", http.StatusMethodNotAllowed)
+			return
+		}
+
+		extras, err := config.LoadExtras(cfg.Services.ExtrasFile)
+		if err != nil {
+			if os.IsNotExist(err) {
+				extras = config.ExtrasFromConfig(cfg)
+				if err := extras.Save(cfg.Services.ExtrasFile); err != nil {
+					log.Printf("reload: create extras: %v", err)
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				log.Printf("reload: created %s from config", cfg.Services.ExtrasFile)
+			} else {
+				log.Printf("reload: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		cfg.ApplyExtras(extras)
+
+		for _, e := range dhcpEntries {
+			e.srv.SetReservations(extras.Reservations)
+			bs := ""
+			if cfg.Services.PXE.Enabled {
+				bs = e.tftpAddr
+			}
+			if bs != "" || extras.PXEBootFile != "" {
+				e.srv.SetPXEOptions(bs, extras.PXEBootFile)
+			}
+			if cfg.Services.PXE.Enabled && len(extras.MacImages) > 0 {
+				e.srv.SetMacPXEBootFiles(extras.MacImages)
+			}
+		}
+
+		if pxeSrv != nil {
+			pxeSrv.SetMacImages(extras.MacImages)
+			if extras.DefaultImage != "" {
+				pxeSrv.SetDefaultImage(extras.DefaultImage)
+			}
+		}
+
+		if smbServer != nil {
+			for _, u := range extras.SMBUsers {
+				if err := smbServer.AddUser(u.Name, u.Password); err != nil {
+					log.Printf("reload: smb add user %s: %v", u.Name, err)
+				}
+			}
+		}
+
+		log.Printf("reload: extras reloaded from %s", cfg.Services.ExtrasFile)
+		fmt.Fprintln(w, "ok")
+	})
+	go func() {
+		addr := ":8080"
+		log.Printf("HTTP API listening on %s", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("HTTP API: %v", err)
+		}
+	}()
+	activeServices = append(activeServices, "HTTP:8080")
 
 	if len(activeServices) > 0 {
 		log.Printf("gokrazy-router running with active services: %s", strings.Join(activeServices, ", "))
@@ -423,7 +499,7 @@ func main() {
 	}
 }
 
-func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string) {
+func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string, macImages map[string]string) {
 	if len(dhcpcfg.Reservations) > 0 {
 		srv.SetReservations(dhcpcfg.Reservations)
 	}
@@ -434,6 +510,9 @@ func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bo
 	}
 	if bootServer != "" || bootFile != "" {
 		srv.SetPXEOptions(bootServer, bootFile)
+	}
+	if pxeEnabled && len(macImages) > 0 {
+		srv.SetMacPXEBootFiles(macImages)
 	}
 }
 

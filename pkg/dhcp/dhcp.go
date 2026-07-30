@@ -24,23 +24,24 @@ type LeaseExpiredCallback func(ip net.IP, mac string)
 // Server is a minimal DHCPv4 server that hands out leases from a
 // configured range on a specific interface.
 type Server struct {
-	iface     string
-	serverIP  net.IP
-	mask      net.IPMask
+	iface      string
+	serverIP   net.IP
+	mask       net.IPMask
 	rangeStart net.IP
 	rangeEnd   net.IP
-	dns       []net.IP
-	lease     time.Duration
-	router    net.IP
+	dns        []net.IP
+	lease      time.Duration
+	router     net.IP
 
-	mu             sync.Mutex
-	leases         map[string]lease // MAC -> lease
-	nextIP         net.IP
-	reservations   map[string]net.IP // normalized MAC -> IP
-	pxeBootServer  net.IP
-	pxeBootFile    string
-	onLease        LeaseCallback
-	onLeaseExpired LeaseExpiredCallback
+	mu              sync.Mutex
+	leases          map[string]lease // MAC -> lease
+	nextIP          net.IP
+	reservations    map[string]net.IP // normalized MAC -> IP
+	pxeBootServer   net.IP
+	pxeBootFile     string
+	macPXEBootFiles map[string]string // normalized MAC -> bootfile (DHCP option 67)
+	onLease         LeaseCallback
+	onLeaseExpired  LeaseExpiredCallback
 }
 
 type lease struct {
@@ -103,13 +104,19 @@ func (s *Server) OnLeaseExpired(cb LeaseExpiredCallback) {
 
 // SetReservations replaces the static MAC -> IP reservation map.
 // MAC addresses are normalized to lower-case xx:xx:xx:xx:xx:xx.
+// Reservations outside this server's subnet are ignored so a reservation
+// for one VLAN is not accidentally served by another VLAN's DHCP server.
 func (s *Server) SetReservations(reservations map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reservations = make(map[string]net.IP, len(reservations))
+	subnet := &net.IPNet{IP: s.serverIP.Mask(s.mask), Mask: s.mask}
 	for mac, ip := range reservations {
 		parsed := net.ParseIP(ip).To4()
 		if parsed == nil {
+			continue
+		}
+		if !subnet.Contains(parsed) {
 			continue
 		}
 		s.reservations[normalizeMAC(mac)] = parsed
@@ -127,6 +134,16 @@ func (s *Server) SetPXEOptions(bootServer string, bootFile string) {
 		}
 	}
 	s.pxeBootFile = bootFile
+}
+
+// SetMacPXEBootFiles replaces the per-client DHCP option 67 bootfile map.
+func (s *Server) SetMacPXEBootFiles(m map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.macPXEBootFiles = make(map[string]string, len(m))
+	for mac, file := range m {
+		s.macPXEBootFiles[normalizeMAC(mac)] = file
+	}
 }
 
 func normalizeMAC(mac string) string {
@@ -367,9 +384,13 @@ func (s *Server) replyOptions(mac string) dhcpv4.Modifier {
 		s.mu.Lock()
 		bootServer := s.pxeBootServer
 		bootFile := s.pxeBootFile
+		if f, ok := s.macPXEBootFiles[normalizeMAC(mac)]; ok {
+			bootFile = f
+		}
 		s.mu.Unlock()
 
 		if bootServer != nil {
+			log.Printf("dhcp: sending option 66 tftp=%s option 67 bootfile=%s", bootServer, bootFile)
 			d.UpdateOption(dhcpv4.OptTFTPServerName(bootServer.String()))
 		}
 		if bootFile != "" {
