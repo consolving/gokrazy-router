@@ -1,9 +1,11 @@
 #!ipxe
-# Example iPXE boot script for netboot.
+# Example iPXE boot script for gokrazy-router.
 #
-# This file is served when an iPXE client requests the boot script.
-# Place it in the VLAN's boot directory (e.g. /data/netboot/trusted/boot.ipxe)
-# or in a per-client image directory (e.g. /data/netboot/trusted/ubuntu-22.04/boot.ipxe).
+# This TEXT file is served once iPXE has already been loaded. The initial
+# legacy PXE ROM must receive the iPXE UNDI binary, usually named
+# undionly.kpxe (configured as services.pxe.legacyBootFile or bootFile).
+#
+# Place this file in the TFTP root (e.g. /mnt/data/tftpboot/boot.ipxe).
 
 dhcp
 echo Booting from gokrazy-router netboot server...

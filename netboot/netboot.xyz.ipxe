@@ -1,0 +1,6 @@
+#!ipxe
+# Chainload the official netboot.xyz iPXE menu.
+# Place this in the TFTP root (e.g. /mnt/data/tftpboot/netboot.xyz.ipxe)
+# and set services.pxe.ipxeScript to "netboot.xyz.ipxe".
+chain --autofree https://boot.netboot.xyz/ipxe/netboot.xyz.ipxe ||
+chain --autofree http://boot.netboot.xyz/ipxe/netboot.xyz.ipxe

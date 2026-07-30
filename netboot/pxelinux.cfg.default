@@ -1,7 +1,7 @@
 # Example pxelinux configuration for legacy PXE boot.
 #
-# Place this at <bootDir>/pxelinux.cfg/default
-# (e.g. /data/netboot/trusted/pxelinux.cfg/default)
+# Place this at <tftpRoot>/pxelinux.cfg/default
+# (e.g. /mnt/data/tftpboot/pxelinux.cfg/default)
 
 DEFAULT linux
 PROMPT 0

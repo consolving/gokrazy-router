@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/insomniacslk/dhcp/dhcpv4"
 )
 
 func TestLeaseExpiry(t *testing.T) {
@@ -198,6 +200,56 @@ func TestSetPXEOptions(t *testing.T) {
 	}
 	if file != "pxelinux.0" {
 		t.Errorf("pxeBootFile = %q, want pxelinux.0", file)
+	}
+}
+
+func TestPXEBootfileSelection(t *testing.T) {
+	s := &Server{
+		iface:    "eth0",
+		serverIP: net.ParseIP("10.0.0.1").To4(),
+		mask:     net.CIDRMask(24, 32),
+	}
+	s.SetPXEOptions("10.0.0.2", "undionly.kpxe")
+	s.SetLegacyBootFile("undionly.kpxe")
+	s.SetUEFIBootFile("netboot.xyz.efi")
+	s.SetIPXEBootFile("boot.ipxe")
+
+	mac := "aa:bb:cc:dd:ee:ff"
+	bootfile := func(req *dhcpv4.DHCPv4) string {
+		mod := s.replyOptions(mac, req)
+		resp, err := dhcpv4.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mod(resp)
+		return string(resp.Options.Get(dhcpv4.OptionBootfileName))
+	}
+
+	// Legacy BIOS PXE ROM has no user-class.
+	legacyReq, err := dhcpv4.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(legacyReq); got != "undionly.kpxe" {
+		t.Errorf("legacy bootfile = %q, want undionly.kpxe", got)
+	}
+
+	// iPXE identifies itself with DHCP option 77 (User Class) = "iPXE".
+	ipxeReq, err := dhcpv4.New(dhcpv4.WithUserClass("iPXE", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(ipxeReq); got != "boot.ipxe" {
+		t.Errorf("iPXE bootfile = %q, want boot.ipxe", got)
+	}
+
+	// UEFI clients advertise architecture type 7 or 9 via option 93.
+	uefiReq, err := dhcpv4.New(dhcpv4.WithGeneric(dhcpv4.OptionClientSystemArchitectureType, []byte{0, 7}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(uefiReq); got != "netboot.xyz.efi" {
+		t.Errorf("UEFI bootfile = %q, want netboot.xyz.efi", got)
 	}
 }
 

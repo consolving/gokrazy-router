@@ -498,7 +498,18 @@ func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bo
 	if len(dhcpcfg.Reservations) > 0 {
 		srv.SetReservations(dhcpcfg.Reservations)
 	}
-	applyPXEBootOptions(srv, pxeEnabled, tftpServer, macImages, pxeCfg)
+	if !pxeEnabled {
+		return
+	}
+	bootServer := tftpServer
+	if dhcpcfg.PXEBootServer != "" {
+		bootServer = dhcpcfg.PXEBootServer
+	}
+	scopePXE := pxeCfg
+	if dhcpcfg.PXEBootFile != "" {
+		scopePXE.BootFile = dhcpcfg.PXEBootFile
+	}
+	applyPXEBootOptions(srv, true, bootServer, macImages, scopePXE)
 }
 
 func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, macImages map[string]string, pxeCfg config.PXEConfig) {
@@ -506,8 +517,10 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 		return
 	}
 
-	bootServer := tftpServer
 	bootFile := pxeCfg.BootFile
+	if bootFile == "" && pxeCfg.DefaultImage != "" {
+		bootFile = pxeCfg.DefaultImage
+	}
 	if bootFile == "" {
 		bootFile = "undionly.kpxe"
 	}
@@ -517,15 +530,19 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 	}
 	uefi := pxeCfg.UEFIBootFile
 	if uefi == "" {
-		uefi = bootFile
+		uefi = "netboot.xyz.efi"
 	}
 	ipxe := pxeCfg.IPXEScript
 	if ipxe == "" {
 		ipxe = "boot.ipxe"
 	}
 
-	if bootServer != "" || bootFile != "" {
-		srv.SetPXEOptions(bootServer, bootFile)
+	if ipxe == bootFile || ipxe == legacy || ipxe == uefi {
+		log.Printf("pxe: warning: ipxe script %q is identical to another boot file; iPXE clients will boot-loop", ipxe)
+	}
+
+	if tftpServer != "" || bootFile != "" {
+		srv.SetPXEOptions(tftpServer, bootFile)
 	}
 	srv.SetLegacyBootFile(legacy)
 	srv.SetUEFIBootFile(uefi)

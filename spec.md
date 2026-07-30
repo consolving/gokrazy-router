@@ -128,9 +128,10 @@ Optional SMB file share of the mounted disk:
 
 Optional PXE boot server:
 
-- Serves boot images over TFTP (`github.com/pin/tftp/v3`)
+- Serves boot images over a built-in UDP TFTP server
 - Supports default image and per-MAC image selection
 - DHCP scopes automatically advertise PXE options 66/67 when enabled
+- Selects the boot file by client type: legacy BIOS, UEFI (option 93), or iPXE (option 77)
 
 #### 9. Configuration (`pkg/config`)
 
@@ -138,78 +139,42 @@ JSON configuration file, loaded at startup:
 
 ```json
 {
-  "wan": {
-    "interface": "wan",
-    "mode": "dhcp"
-  },
-  "lan": {
-    "bridge": "br-lan",
-    "interfaces": ["lan1", "lan2", "lan3", "lan4"],
-    "address": "10.0.0.1/24",
-    "dhcp": {
-      "enabled": true,
-      "rangeStart": "10.0.0.100",
-      "rangeEnd": "10.0.0.250",
-      "leaseDuration": "12h",
-      "dns": ["1.1.1.1", "8.8.8.8"]
-    }
-  },
+  "wan": {"interface": "wan", "mode": "dhcp"},
+  "lan": {"bridge": "br-lan", "interfaces": ["lan1", "lan2", "lan3", "lan4"], "address": "10.0.0.1/24", "dhcp": {"enabled": true, "rangeStart": "10.0.0.100", "rangeEnd": "10.0.0.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]}},
   "vlans": [
     {
-      "id": 100,
-      "name": "guest",
-      "ports": ["lan3", "lan4"],
+      "id": 100, "name": "guest", "ports": ["lan3", "lan4"],
       "address": "10.0.100.1/24",
-      "dhcp": {
-        "enabled": true,
-        "rangeStart": "10.0.100.100",
-        "rangeEnd": "10.0.100.250",
-        "dns": ["1.1.1.1"]
-      },
+      "dhcp": {"enabled": true, "rangeStart": "10.0.100.100", "rangeEnd": "10.0.100.250", "dns": ["1.1.1.1"]},
       "nat": true
     },
     {
-      "id": 1,
-      "name": "trusted",
-      "ports": ["lan1"],
+      "id": 1, "name": "trusted", "ports": ["lan1"],
       "address": "10.0.1.1/24",
-      "dhcp": {
-        "enabled": true,
-        "rangeStart": "10.0.1.100",
-        "rangeEnd": "10.0.1.250",
-        "dns": ["1.1.1.1", "8.8.8.8"]
-      },
-      "nat": true,
-      "netboot": {
-        "enabled": true,
-        "tftp": true,
-        "http": true,
-        "bootDir": "/data/netboot/trusted",
-        "defaultBoot": "pxelinux.0",
-        "ipxeScript": "boot.ipxe"
-      }
+      "dhcp": {"enabled": true, "rangeStart": "10.0.1.100", "rangeEnd": "10.0.1.250", "dns": ["1.1.1.1", "8.8.8.8"], "pxeBootFile": "undionly.kpxe"},
+      "nat": true
     }
   ],
-  "nat": {
-    "enabled": true,
-    "outInterface": "wan"
-  },
-  "netboot": {
-    "dir": "/data/netboot",
-    "httpPort": ":8069"
-  },
+  "nat": {"enabled": true, "outInterface": "wan"},
   "wifi": {
-    "enabled": true,
-    "interface": "wlan0",
-    "bridge": "br-lan",
-    "hostapdBin": "/usr/local/bin/hostapd",
-    "ssid": "gokrazy",
-    "passphrase": "changeme123",
-    "channel": 6,
-    "hwMode": "g",
-    "htCapab": "[HT40+][SHORT-GI-20][SHORT-GI-40]",
-    "countryCode": "DE",
-    "wpa": 2
+    "enabled": true, "interface": "wlan0",
+    "address": "10.0.200.1/24",
+    "dhcp": {"enabled": true, "rangeStart": "10.0.200.100", "rangeEnd": "10.0.200.250", "dns": ["1.1.1.1", "8.8.8.8"]},
+    "ssid": "gokrazy", "passphrase": "changeme123",
+    "channel": 6, "hwMode": "g", "countryCode": "DE", "wpa": 2
+  },
+  "services": {
+    "mount": {"enabled": true, "device": "/dev/sda1", "fsType": "ext4", "target": "/mnt/data", "options": "defaults,noatime"},
+    "pxe": {
+      "enabled": true,
+      "listen": "0.0.0.0:69",
+      "tftpRoot": "/mnt/data/tftpboot",
+      "defaultImage": "undionly.kpxe",
+      "bootFile": "undionly.kpxe",
+      "legacyBootFile": "undionly.kpxe",
+      "uefiBootFile": "netboot.xyz.efi",
+      "ipxeScript": "boot.ipxe"
+    }
   }
 }
 ```

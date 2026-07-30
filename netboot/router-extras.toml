@@ -1,0 +1,23 @@
+# Runtime extras config for gokrazy-router.
+# Place this on the mounted disk as /mnt/data/router-extras.toml and
+# configure services.extrasFile to point to it.
+#
+# This file is re-read on every gokrazy router restart, so changes to
+# reservations, PXE images, and boot files take effect without redeploying.
+
+# Static DHCP reservations (MAC -> IP). Only applied to the matching subnet.
+[reservations]
+"aa:bb:cc:dd:ee:ff" = "10.0.1.10"
+
+# Per-MAC PXE image file name. The requested TFTP filename is matched
+# against the client MAC address.
+[macImages]
+"5c:ff:35:0d:b3:49" = "netboot.xyz.kpxe"
+"aa:bb:cc:dd:ee:ff" = "netboot.xyz.kpxe"
+
+# PXE boot file selection. These override the global services.pxe defaults.
+defaultImage = "netboot.xyz.kpxe"
+pxeBootFile = "netboot.xyz.kpxe"
+legacyBootFile = "netboot.xyz.kpxe"
+uefiBootFile = "netboot.xyz.efi"
+ipxeScript = "netboot.xyz.ipxe"

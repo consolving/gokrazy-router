@@ -9,7 +9,7 @@
 #   name           - Human-readable label (optional)
 #   hostname       - Expected DHCP hostname (optional, informational)
 #   ip             - Static DHCP reservation (optional)
-#   netboot_image  - Subdirectory in the VLAN's bootDir for this client (optional)
+#   netboot_image  - Subdirectory in the TFTP root for this client (optional)
 
 default_vlan = 30
 
