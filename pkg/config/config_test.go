@@ -225,6 +225,109 @@ func TestApplyExtras(t *testing.T) {
 	}
 }
 
+func TestExtrasSetReservation(t *testing.T) {
+	e := &ExtrasConfig{}
+	if err := e.SetReservation("aa:bb:cc:dd:ee:ff", "10.0.1.10"); err != nil {
+		t.Fatalf("SetReservation: %v", err)
+	}
+	if e.Reservations["aa:bb:cc:dd:ee:ff"] != "10.0.1.10" {
+		t.Errorf("expected 10.0.1.10, got %s", e.Reservations["aa:bb:cc:dd:ee:ff"])
+	}
+	if err := e.SetReservation("aa:bb:cc:dd:ee:ff", "10.0.1.10"); err != ErrNotModified {
+		t.Errorf("expected ErrNotModified, got %v", err)
+	}
+	if err := e.SetReservation("aa:bb:cc:dd:ee:ff", "10.0.1.11"); err != nil {
+		t.Fatalf("SetReservation update: %v", err)
+	}
+	if e.Reservations["aa:bb:cc:dd:ee:ff"] != "10.0.1.11" {
+		t.Errorf("expected 10.0.1.11, got %s", e.Reservations["aa:bb:cc:dd:ee:ff"])
+	}
+}
+
+func TestExtrasRemoveReservation(t *testing.T) {
+	e := &ExtrasConfig{}
+	if err := e.RemoveReservation("aa:bb:cc:dd:ee:ff"); err != ErrNotModified {
+		t.Errorf("expected ErrNotModified for empty, got %v", err)
+	}
+	e.Reservations = map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"}
+	if err := e.RemoveReservation("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("RemoveReservation: %v", err)
+	}
+	if _, ok := e.Reservations["aa:bb:cc:dd:ee:ff"]; ok {
+		t.Error("reservation should be deleted")
+	}
+}
+
+func TestExtrasSetMacImage(t *testing.T) {
+	e := &ExtrasConfig{}
+	if err := e.SetMacImage("aa:bb:cc:dd:ee:ff", "ipxe.efi"); err != nil {
+		t.Fatalf("SetMacImage: %v", err)
+	}
+	if e.MacImages["aa:bb:cc:dd:ee:ff"] != "ipxe.efi" {
+		t.Errorf("expected ipxe.efi, got %s", e.MacImages["aa:bb:cc:dd:ee:ff"])
+	}
+	if err := e.SetMacImage("aa:bb:cc:dd:ee:ff", "ipxe.efi"); err != ErrNotModified {
+		t.Errorf("expected ErrNotModified, got %v", err)
+	}
+}
+
+func TestExtrasRemoveMacImage(t *testing.T) {
+	e := &ExtrasConfig{}
+	if err := e.RemoveMacImage("aa:bb:cc:dd:ee:ff"); err != ErrNotModified {
+		t.Errorf("expected ErrNotModified for empty, got %v", err)
+	}
+	e.MacImages = map[string]string{"aa:bb:cc:dd:ee:ff": "ipxe.efi"}
+	if err := e.RemoveMacImage("aa:bb:cc:dd:ee:ff"); err != nil {
+		t.Fatalf("RemoveMacImage: %v", err)
+	}
+}
+
+func TestExtrasSaveLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "extras.toml")
+
+	orig := &ExtrasConfig{
+		Reservations: map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
+		MacImages:    map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
+		SMBUsers:     []SMBUser{{Name: "backup", Password: "secret"}},
+	}
+	if err := orig.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := LoadExtras(path)
+	if err != nil {
+		t.Fatalf("LoadExtras: %v", err)
+	}
+	if loaded.Reservations["aa:bb:cc:dd:ee:ff"] != "10.0.1.10" {
+		t.Errorf("reservation mismatch: %s", loaded.Reservations["aa:bb:cc:dd:ee:ff"])
+	}
+	if loaded.MacImages["11:22:33:44:55:66"] != "ubuntu.efi" {
+		t.Errorf("mac image mismatch: %s", loaded.MacImages["11:22:33:44:55:66"])
+	}
+	if len(loaded.SMBUsers) != 1 || loaded.SMBUsers[0].Name != "backup" {
+		t.Errorf("smb users mismatch: %+v", loaded.SMBUsers)
+	}
+}
+
+func TestExtrasSaveLoadEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.toml")
+
+	e := &ExtrasConfig{}
+	if err := e.Save(path); err != nil {
+		t.Fatalf("Save empty: %v", err)
+	}
+
+	loaded, err := LoadExtras(path)
+	if err != nil {
+		t.Fatalf("LoadExtras: %v", err)
+	}
+	if len(loaded.Reservations) != 0 || len(loaded.MacImages) != 0 {
+		t.Error("expected empty extras")
+	}
+}
+
 func TestNormalizeMAC(t *testing.T) {
 	cases := []struct {
 		in   string

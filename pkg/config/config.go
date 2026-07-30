@@ -10,6 +10,9 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
+// ErrNotModified is returned when a change operation would result in no modification.
+var ErrNotModified = fmt.Errorf("not modified")
+
 type Config struct {
 	WAN      WANConfig      `json:"wan"`
 	LAN      LANConfig      `json:"lan"`
@@ -126,6 +129,74 @@ type ExtrasConfig struct {
 type SMBUser struct {
 	Name     string `toml:"name"`
 	Password string `toml:"password"`
+}
+
+// Encode marshals the extras config to TOML bytes.
+func (e *ExtrasConfig) Encode() ([]byte, error) {
+	return toml.Marshal(e)
+}
+
+// Save writes the extras config to a TOML file.
+func (e *ExtrasConfig) Save(path string) error {
+	data, err := e.Encode()
+	if err != nil {
+		return fmt.Errorf("extras: marshal: %w", err)
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// SetReservation adds or updates a MAC-to-IP reservation.
+// Returns ErrNotModified if the reservation already exists with the same IP.
+func (e *ExtrasConfig) SetReservation(mac, ip string) error {
+	mac = normalizeMAC(mac)
+	if e.Reservations == nil {
+		e.Reservations = make(map[string]string)
+	}
+	if e.Reservations[mac] == ip {
+		return ErrNotModified
+	}
+	e.Reservations[mac] = ip
+	return nil
+}
+
+// RemoveReservation deletes a MAC reservation. Returns ErrNotModified if not found.
+func (e *ExtrasConfig) RemoveReservation(mac string) error {
+	mac = normalizeMAC(mac)
+	if e.Reservations == nil {
+		return ErrNotModified
+	}
+	if _, ok := e.Reservations[mac]; !ok {
+		return ErrNotModified
+	}
+	delete(e.Reservations, mac)
+	return nil
+}
+
+// SetMacImage adds or updates a MAC-to-PXE-image mapping.
+// Returns ErrNotModified if the mapping already exists with the same image.
+func (e *ExtrasConfig) SetMacImage(mac, image string) error {
+	mac = normalizeMAC(mac)
+	if e.MacImages == nil {
+		e.MacImages = make(map[string]string)
+	}
+	if e.MacImages[mac] == image {
+		return ErrNotModified
+	}
+	e.MacImages[mac] = image
+	return nil
+}
+
+// RemoveMacImage deletes a MAC image mapping. Returns ErrNotModified if not found.
+func (e *ExtrasConfig) RemoveMacImage(mac string) error {
+	mac = normalizeMAC(mac)
+	if e.MacImages == nil {
+		return ErrNotModified
+	}
+	if _, ok := e.MacImages[mac]; !ok {
+		return ErrNotModified
+	}
+	delete(e.MacImages, mac)
+	return nil
 }
 
 func (d DHCPConfig) ParseLeaseDuration() time.Duration {
