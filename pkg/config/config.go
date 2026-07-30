@@ -94,13 +94,14 @@ type MountConfig struct {
 // SMBConfig starts an external smbd process to share the mounted volume.
 // Credentials and paths support ${ENV} expansion.
 type SMBConfig struct {
-	Enabled   bool   `json:"enabled"`
-	BinPath   string `json:"binPath,omitempty"`   // default: /usr/local/bin/smbd
-	Listen    string `json:"listen,omitempty"`    // default: 0.0.0.0:445
-	ShareName string `json:"shareName,omitempty"` // default: data
-	SharePath string `json:"sharePath,omitempty"` // default: mount target
-	User      string `json:"user,omitempty"`      // e.g. ${SMB_USER}
-	Password  string `json:"password,omitempty"`  // e.g. ${SMB_PASSWORD}
+	Enabled             bool   `json:"enabled"`
+	BinPath             string `json:"binPath,omitempty"`             // default: /usr/local/bin/smbd
+	Listen              string `json:"listen,omitempty"`              // default: 0.0.0.0:445
+	ShareName           string `json:"shareName,omitempty"`           // default: data
+	SharePath           string `json:"sharePath,omitempty"`           // default: mount target
+	User                string `json:"user,omitempty"`                // e.g. ${SMB_USER}
+	Password            string `json:"password,omitempty"`            // e.g. ${SMB_PASSWORD}
+	UsePortableServer   bool   `json:"usePortableServer,omitempty"`   // use fiddyschmitt/portable-smb-server instead of Samba smbd
 }
 
 // PXEConfig starts a TFTP server and answers PXE boot requests.

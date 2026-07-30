@@ -10,7 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"strconv"
 	"text/template"
 	"time"
 
@@ -18,8 +18,9 @@ import (
 )
 
 type Server struct {
-	cfg config.SMBConfig
-	cmd *exec.Cmd
+	cfg     config.SMBConfig
+	cmd     *exec.Cmd
+	isSamba bool
 }
 
 func New(cfg config.SMBConfig) *Server {
@@ -38,8 +39,10 @@ lock directory = /tmp
 state directory = /tmp
 cache directory = /tmp
 private dir = /tmp
-interfaces = {{.Interfaces}}
+{{- if .IfaceParam }}
+interfaces = {{.IfaceParam}}
 bind interfaces only = yes
+{{- end }}
 server min protocol = SMB2_10
 server max protocol = SMB3_11
 
@@ -77,37 +80,90 @@ func (s *Server) Start() error {
 	if listen == "" {
 		listen = "0.0.0.0:445"
 	}
+
+	if s.cfg.UsePortableServer || filepath.Base(bin) == "portable-smb-server" {
+		return s.startPortable(bin, listen)
+	}
+	return s.startSamba(bin, listen)
+}
+
+func (s *Server) startPortable(bin, listen string) error {
+	host, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("smb: invalid listen address %q: %w", listen, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("smb: invalid listen port %q: %w", portStr, err)
+	}
+	shareName := s.cfg.ShareName
+	if shareName == "" {
+		shareName = "data"
+	}
+
+	log.Printf("smb: starting portable-smb-server on %s, share %s at %s for user %s", listen, shareName, s.cfg.SharePath, s.cfg.User)
+	s.cmd = exec.Command(bin,
+		"-ip", host,
+		"-port", strconv.Itoa(port),
+		"-user", s.cfg.User,
+		"-pass", s.cfg.Password,
+		"-folder", s.cfg.SharePath,
+		"-share", shareName,
+	)
+	s.cmd.Stdout = os.Stdout
+	s.cmd.Stderr = os.Stderr
+	if err := s.cmd.Start(); err != nil {
+		return fmt.Errorf("smb: start portable-smb-server: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) startSamba(bin, listen string) error {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
 		host = listen
 	}
 
+	shareName := s.cfg.ShareName
+	if shareName == "" {
+		shareName = "data"
+	}
+
 	confPath := "/tmp/smb.conf"
-	t := template.Must(template.New("smb").Parse(confTemplate))
-	var buf bytes.Buffer
-	if err := t.Execute(&buf, map[string]string{
-		"Interfaces": host,
-		"ShareName":  s.cfg.ShareName,
+
+	ifaceParam := host
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		ifaceParam = ""
+	}
+	tmplData := map[string]string{
+		"IfaceParam": ifaceParam,
+		"ShareName":  shareName,
 		"SharePath":  s.cfg.SharePath,
 		"User":       s.cfg.User,
-	}); err != nil {
+	}
+
+	t := template.Must(template.New("smb").Parse(confTemplate))
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, tmplData); err != nil {
 		return fmt.Errorf("smb: generate config: %w", err)
 	}
 	if err := os.WriteFile(confPath, buf.Bytes(), 0644); err != nil {
 		return fmt.Errorf("smb: write config: %w", err)
 	}
 
-	if err := createUser(bin, s.cfg.User, s.cfg.Password); err != nil {
+	if err := createUser(confPath, s.cfg.User, s.cfg.Password); err != nil {
 		return fmt.Errorf("smb: create user: %w", err)
 	}
 
-	log.Printf("smb: starting smbd on %s, share %s at %s for user %s", listen, s.cfg.ShareName, s.cfg.SharePath, s.cfg.User)
+	log.Printf("smb: starting smbd on %s, share %s at %s for user %s", listen, shareName, s.cfg.SharePath, s.cfg.User)
 	s.cmd = exec.Command(bin, "--foreground", "--no-process-group", "-s", confPath)
 	s.cmd.Stdout = os.Stdout
 	s.cmd.Stderr = os.Stderr
 	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("smb: start smbd: %w", err)
 	}
+
+	s.isSamba = true
 
 	// Give smbd a moment and verify it is listening.
 	go func() {
@@ -120,6 +176,16 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// AddUser creates an additional SMB user in the password database.
+// Only supported for Samba (smbd) mode; returns an error for portable mode.
+func (s *Server) AddUser(user, password string) error {
+	if !s.isSamba {
+		return fmt.Errorf("smb: AddUser only supported in Samba mode")
+	}
+	log.Printf("smb: adding additional user %s", user)
+	return createUser("/tmp/smb.conf", user, password)
+}
+
 func (s *Server) Stop() error {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Signal(os.Interrupt)
@@ -129,47 +195,36 @@ func (s *Server) Stop() error {
 }
 
 // createUser tries to add the user using smbpasswd that ships with the binary.
-func createUser(smbdBin, user, password string) error {
-	dir := filepath.Dir(smbdBin)
-	smbpasswd := filepath.Join(dir, "smbpasswd")
-	if _, err := os.Stat(smbpasswd); err != nil {
-		// Some static bundles ship smbpasswd next to smbd; otherwise fall back to PATH.
-		smbpasswd = "smbpasswd"
-	}
+func createUser(confPath, user, password string) error {
+	smbpasswd := "smbpasswd"
 
-	cmd := exec.Command(smbpasswd, "-s", "-a", user)
-	cmd.Env = append(os.Environ(), "PASSWD="+password)
-	stdin, err := cmd.StdinPipe()
+	addCmd := exec.Command(smbpasswd, "-s", "-a", user)
+	addCmd.Env = append(os.Environ(), "SMB_CONF_PATH="+confPath)
+	addCmd.Stderr = os.Stderr
+	addCmd.Stdout = os.Stdout
+	stdin, err := addCmd.StdinPipe()
 	if err != nil {
 		return err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
-	cmd.Stdout = os.Stdout
-	if err := cmd.Start(); err != nil {
+	if err := addCmd.Start(); err != nil {
 		return err
 	}
-	// smbpasswd -s reads password twice (new + retype) from stdin.
 	_, _ = io.WriteString(stdin, password+"\n")
 	_, _ = io.WriteString(stdin, password+"\n")
 	_ = stdin.Close()
-	if err := cmd.Wait(); err != nil {
-		msg := strings.TrimSpace(stderrBuf.String())
-		if strings.Contains(msg, "already exists") {
-			log.Printf("smb: user %s already exists, updating password", user)
-			// Try update instead.
-			cmd2 := exec.Command(smbpasswd, "-s", user)
-			cmd2.Env = append(os.Environ(), "PASSWD="+password)
-			stdin2, _ := cmd2.StdinPipe()
-			cmd2.Stderr = os.Stderr
-			cmd2.Stdout = os.Stdout
-			_ = cmd2.Start()
-			_, _ = io.WriteString(stdin2, password+"\n")
-			_, _ = io.WriteString(stdin2, password+"\n")
-			_ = stdin2.Close()
-			return cmd2.Wait()
-		}
-		return fmt.Errorf("%s: %w", msg, err)
+	if err := addCmd.Wait(); err != nil {
+		// User may already exist — try update.
+		log.Printf("smb: user %s already exists, updating password", user)
+		updCmd := exec.Command(smbpasswd, "-s", user)
+		updCmd.Env = append(os.Environ(), "SMB_CONF_PATH="+confPath)
+		updCmd.Stderr = os.Stderr
+		updCmd.Stdout = os.Stdout
+		stdin2, _ := updCmd.StdinPipe()
+		_ = updCmd.Start()
+		_, _ = io.WriteString(stdin2, password+"\n")
+		_, _ = io.WriteString(stdin2, password+"\n")
+		_ = stdin2.Close()
+		return updCmd.Wait()
 	}
 	log.Printf("smb: user %s created", user)
 	return nil

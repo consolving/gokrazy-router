@@ -52,8 +52,11 @@ func main() {
 
 	// Load optional extras file from the mounted volume. It overrides/extends
 	// reservations, PXE images and SMB users. Reload happens on every restart.
+	var extras *config.ExtrasConfig
 	if cfg.Services.ExtrasFile != "" {
-		if extras, err := config.LoadExtras(cfg.Services.ExtrasFile); err != nil {
+		var err error
+		extras, err = config.LoadExtras(cfg.Services.ExtrasFile)
+		if err != nil {
 			log.Printf("extras: %v (continuing without)", err)
 		} else {
 			cfg.ApplyExtras(extras)
@@ -348,6 +351,13 @@ func main() {
 			log.Printf("smb: %v (continuing without SMB)", err)
 		} else {
 			activeServices = append(activeServices, fmt.Sprintf("SMB(%s@%s)", cfg.Services.SMB.ShareName, cfg.Services.SMB.Listen))
+			if extras != nil {
+				for _, u := range extras.SMBUsers {
+					if err := smbServer.AddUser(u.Name, u.Password); err != nil {
+						log.Printf("smb: add extras user %s: %v", u.Name, err)
+					}
+				}
+			}
 		}
 	}
 

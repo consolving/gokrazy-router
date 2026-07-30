@@ -33,6 +33,7 @@ const (
 	acceptMACPath  = "/tmp/hostapd.accept"
 	vlanFilePath   = "/tmp/hostapd.vlan"
 	hostapdPath    = "/usr/local/bin/hostapd"
+	ctrlPath       = "/tmp/hostapd" // /var/run may not be writable in gokrazy
 )
 
 // ClientEvent describes a WiFi client association or disassociation.
@@ -73,7 +74,7 @@ interface={{.Interface}}
 bridge={{.Bridge}}
 {{- end}}
 driver=nl80211
-ctrl_interface=/var/run/hostapd
+ctrl_interface={{.CtrlPath}}
 ssid={{.SSID}}
 hw_mode={{.HWMode}}
 channel={{.Channel}}
@@ -201,6 +202,7 @@ func (ap *AP) writeConfig() error {
 		VLANFile      string
 		AcceptMACFile string
 		VLANBridge    string
+		CtrlPath      string
 	}{
 		WiFiConfig:    ap.cfg,
 		Bridge:        ap.bridge,
@@ -211,6 +213,7 @@ func (ap *AP) writeConfig() error {
 		// We use "br-vlan" so it creates "br-vlan10", "br-vlan20", etc.
 		// matching our VLAN bridge names.
 		VLANBridge: "br-vlan",
+		CtrlPath:   ctrlPath,
 	}
 
 	f, err := os.Create(confPath)
@@ -271,6 +274,12 @@ func (ap *AP) MacMap() *macmap.MapFile {
 
 // launch starts a new hostapd process.
 func (ap *AP) launch() error {
+	// hostapd's ctrl_interface directory does not exist in the minimal
+	// gokrazy root filesystem. Create it explicitly before starting.
+	if err := os.MkdirAll(ctrlPath, 0755); err != nil {
+		return fmt.Errorf("wifi: create ctrl interface dir: %w", err)
+	}
+
 	ap.cmd = exec.Command(hostapdPath, confPath)
 	ap.cmd.Env = os.Environ()
 
