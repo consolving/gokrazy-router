@@ -110,24 +110,30 @@ type SMBConfig struct {
 
 // PXEConfig starts a TFTP server and answers PXE boot requests.
 type PXEConfig struct {
-	Enabled       bool              `json:"enabled"`
-	Listen        string            `json:"listen,omitempty"`        // default: 0.0.0.0:69
-	BindInterface string            `json:"bindInterface,omitempty"` // SO_BINDTODEVICE target interface (e.g., br-vlan31)
-	TFTPRoot      string            `json:"tftpRoot,omitempty"`      // directory containing boot images
-	DefaultImage  string            `json:"defaultImage,omitempty"`  // filename used when MAC is unknown
-	MacImages     map[string]string `json:"macImages,omitempty"`     // MAC (lower case) -> filename
-	BootFile      string            `json:"bootFile,omitempty"`      // legacy option 67 value
+	Enabled        bool              `json:"enabled"`
+	Listen         string            `json:"listen,omitempty"`         // default: 0.0.0.0:69
+	BindInterface  string            `json:"bindInterface,omitempty"`  // SO_BINDTODEVICE target interface (e.g., br-vlan31)
+	TFTPRoot       string            `json:"tftpRoot,omitempty"`       // directory containing boot images
+	DefaultImage   string            `json:"defaultImage,omitempty"`   // filename used when MAC is unknown
+	MacImages      map[string]string `json:"macImages,omitempty"`      // MAC (lower case) -> filename
+	BootFile       string            `json:"bootFile,omitempty"`       // default option 67 bootfile
+	LegacyBootFile string            `json:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
+	UEFIBootFile   string            `json:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
+	IPXEScript     string            `json:"ipxeScript,omitempty"`     // option 67 once an iPXE client identifies itself
 }
 
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations  map[string]string `toml:"reservations"`            // MAC -> IP
-	MacImages     map[string]string `toml:"macImages"`               // MAC -> PXE image filename
-	DefaultImage  string            `toml:"defaultImage"`            // PXE default image (overrides router.json)
-	PXEBootFile   string            `toml:"pxeBootFile"`             // DHCP option 67 bootfile (applied to all subnets)
-	SMBUsers      []SMBUser         `toml:"smbUsers"`                // additional SMB users
-	VLANAddresses map[int]string    `toml:"vlanAddresses,omitempty"` // VLAN ID -> CIDR address override
+	Reservations   map[string]string `toml:"reservations"`             // MAC -> IP
+	MacImages      map[string]string `toml:"macImages"`                // MAC -> PXE image filename
+	DefaultImage   string            `toml:"defaultImage"`             // PXE default image (overrides router.json)
+	PXEBootFile    string            `toml:"pxeBootFile"`              // DHCP option 67 bootfile (applied to all subnets)
+	LegacyBootFile string            `toml:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
+	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
+	IPXEScript     string            `toml:"ipxeScript,omitempty"`     // option 67 once iPXE identifies itself
+	SMBUsers       []SMBUser         `toml:"smbUsers"`                 // additional SMB users
+	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`  // VLAN ID -> CIDR address override
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -261,6 +267,9 @@ func (c *Config) ExpandEnv() {
 	c.Services.PXE.TFTPRoot = e(c.Services.PXE.TFTPRoot)
 	c.Services.PXE.DefaultImage = e(c.Services.PXE.DefaultImage)
 	c.Services.PXE.BootFile = e(c.Services.PXE.BootFile)
+	c.Services.PXE.LegacyBootFile = e(c.Services.PXE.LegacyBootFile)
+	c.Services.PXE.UEFIBootFile = e(c.Services.PXE.UEFIBootFile)
+	c.Services.PXE.IPXEScript = e(c.Services.PXE.IPXEScript)
 	for k, v := range c.Services.PXE.MacImages {
 		c.Services.PXE.MacImages[k] = e(v)
 	}
@@ -315,6 +324,15 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 		c.WiFi.DHCP.PXEBootFile = extras.PXEBootFile
 		c.LAN.DHCP.PXEBootFile = extras.PXEBootFile
 	}
+	if extras.LegacyBootFile != "" {
+		c.Services.PXE.LegacyBootFile = extras.LegacyBootFile
+	}
+	if extras.UEFIBootFile != "" {
+		c.Services.PXE.UEFIBootFile = extras.UEFIBootFile
+	}
+	if extras.IPXEScript != "" {
+		c.Services.PXE.IPXEScript = extras.IPXEScript
+	}
 	for id, addr := range extras.VLANAddresses {
 		for i := range c.VLANs {
 			if c.VLANs[i].ID == id {
@@ -347,12 +365,10 @@ func ExtrasFromConfig(c *Config) *ExtrasConfig {
 		e.MacImages[mac] = img
 	}
 	e.DefaultImage = c.Services.PXE.DefaultImage
-	for _, v := range c.VLANs {
-		if v.DHCP.PXEBootFile != "" {
-			e.PXEBootFile = v.DHCP.PXEBootFile
-			break
-		}
-	}
+	e.PXEBootFile = c.Services.PXE.BootFile
+	e.LegacyBootFile = c.Services.PXE.LegacyBootFile
+	e.UEFIBootFile = c.Services.PXE.UEFIBootFile
+	e.IPXEScript = c.Services.PXE.IPXEScript
 	e.VLANAddresses = make(map[int]string)
 	for _, v := range c.VLANs {
 		e.VLANAddresses[v.ID] = v.Address

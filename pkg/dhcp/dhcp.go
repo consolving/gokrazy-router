@@ -2,6 +2,8 @@
 package dhcp
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -40,6 +42,9 @@ type Server struct {
 	pxeBootServer   net.IP
 	pxeBootFile     string
 	macPXEBootFiles map[string]string // normalized MAC -> bootfile (DHCP option 67)
+	ipxeBootFile    string            // bootfile for clients that already run iPXE
+	uefiBootFile    string            // bootfile for UEFI PXE clients
+	legacyBootFile  string            // bootfile for legacy BIOS PXE clients
 	onLease         LeaseCallback
 	onLeaseExpired  LeaseExpiredCallback
 }
@@ -144,6 +149,27 @@ func (s *Server) SetMacPXEBootFiles(m map[string]string) {
 	for mac, file := range m {
 		s.macPXEBootFiles[normalizeMAC(mac)] = file
 	}
+}
+
+// SetIPXEBootFile sets the bootfile offered to clients that identify as iPXE.
+func (s *Server) SetIPXEBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ipxeBootFile = file
+}
+
+// SetUEFIBootFile sets the bootfile offered to UEFI PXE clients.
+func (s *Server) SetUEFIBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uefiBootFile = file
+}
+
+// SetLegacyBootFile sets the bootfile offered to legacy BIOS PXE clients.
+func (s *Server) SetLegacyBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.legacyBootFile = file
 }
 
 func normalizeMAC(mac string) string {
@@ -254,7 +280,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 
 	var resp *dhcpv4.DHCPv4
 	var err error
-	opts := s.replyOptions(mac)
+	opts := s.replyOptions(mac, req)
 
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover:
@@ -379,7 +405,7 @@ func (s *Server) clearLeasesForIP(ip net.IP) {
 	}
 }
 
-func (s *Server) replyOptions(mac string) dhcpv4.Modifier {
+func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 	return func(d *dhcpv4.DHCPv4) {
 		s.mu.Lock()
 		bootServer := s.pxeBootServer
@@ -387,13 +413,48 @@ func (s *Server) replyOptions(mac string) dhcpv4.Modifier {
 		if f, ok := s.macPXEBootFiles[normalizeMAC(mac)]; ok {
 			bootFile = f
 		}
+		ipxe := s.ipxeBootFile
+		uefi := s.uefiBootFile
+		legacy := s.legacyBootFile
 		s.mu.Unlock()
 
+		classified := ""
+		if req != nil && ipxe != "" {
+			uc := req.Options.Get(dhcpv4.OptionUserClassInformation)
+			if len(uc) > 0 && bytes.Contains(bytes.ToLower(uc), []byte("ipxe")) {
+				bootFile = ipxe
+				classified = "ipxe"
+			}
+		}
+
+		if classified == "" && req != nil {
+			archBytes := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
+			if len(archBytes) >= 2 {
+				arch := binary.BigEndian.Uint16(archBytes)
+				switch arch {
+				case 7, 9:
+					if uefi != "" {
+						bootFile = uefi
+						classified = "uefi"
+					}
+				default:
+					if legacy != "" {
+						bootFile = legacy
+						classified = "legacy"
+					}
+				}
+			} else if legacy != "" {
+				bootFile = legacy
+				classified = "legacy"
+			}
+		}
+
 		if bootServer != nil {
-			log.Printf("dhcp: sending option 66 tftp=%s option 67 bootfile=%s", bootServer, bootFile)
+			log.Printf("dhcp: %s sending option 66 tftp=%s option 67 bootfile=%s", mac, bootServer, bootFile)
 			d.UpdateOption(dhcpv4.OptTFTPServerName(bootServer.String()))
 		}
 		if bootFile != "" {
+			log.Printf("dhcp: %s selected %s bootfile=%s", mac, classified, bootFile)
 			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
 		}
 	}

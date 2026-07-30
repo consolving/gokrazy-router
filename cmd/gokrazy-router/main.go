@@ -258,7 +258,7 @@ func main() {
 				log.Fatalf("dhcp vlan %d: %v", vc.ID, err)
 			}
 			dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(vc.Address)})
-			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address), cfg.Services.PXE.MacImages)
+			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 			if mon != nil {
 				vlanName := vc.Name
 				if vlanName == "" {
@@ -297,7 +297,7 @@ func main() {
 			log.Fatalf("dhcp: %v", err)
 		}
 		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.LAN.Address)})
-		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address), cfg.Services.PXE.MacImages)
+		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "L"); err != nil {
@@ -332,7 +332,7 @@ func main() {
 			log.Fatalf("dhcp wifi: %v", err)
 		}
 		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.WiFi.Address)})
-		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address), cfg.Services.PXE.MacImages)
+		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
 				if err := mon.AddClient(ip, mac, "W"); err != nil {
@@ -437,12 +437,7 @@ func main() {
 			if cfg.Services.PXE.Enabled {
 				bs = e.tftpAddr
 			}
-			if bs != "" || extras.PXEBootFile != "" {
-				e.srv.SetPXEOptions(bs, extras.PXEBootFile)
-			}
-			if cfg.Services.PXE.Enabled && len(extras.MacImages) > 0 {
-				e.srv.SetMacPXEBootFiles(extras.MacImages)
-			}
+			applyPXEBootOptions(e.srv, cfg.Services.PXE.Enabled, bs, cfg.Services.PXE.MacImages, cfg.Services.PXE)
 		}
 
 		if pxeSrv != nil {
@@ -499,19 +494,43 @@ func main() {
 	}
 }
 
-func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string, macImages map[string]string) {
+func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string, macImages map[string]string, pxeCfg config.PXEConfig) {
 	if len(dhcpcfg.Reservations) > 0 {
 		srv.SetReservations(dhcpcfg.Reservations)
 	}
-	bootServer := dhcpcfg.PXEBootServer
-	bootFile := dhcpcfg.PXEBootFile
-	if pxeEnabled && bootServer == "" && tftpServer != "" {
-		bootServer = tftpServer
+	applyPXEBootOptions(srv, pxeEnabled, tftpServer, macImages, pxeCfg)
+}
+
+func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, macImages map[string]string, pxeCfg config.PXEConfig) {
+	if !pxeEnabled {
+		return
 	}
+
+	bootServer := tftpServer
+	bootFile := pxeCfg.BootFile
+	if bootFile == "" {
+		bootFile = "undionly.kpxe"
+	}
+	legacy := pxeCfg.LegacyBootFile
+	if legacy == "" {
+		legacy = bootFile
+	}
+	uefi := pxeCfg.UEFIBootFile
+	if uefi == "" {
+		uefi = bootFile
+	}
+	ipxe := pxeCfg.IPXEScript
+	if ipxe == "" {
+		ipxe = "boot.ipxe"
+	}
+
 	if bootServer != "" || bootFile != "" {
 		srv.SetPXEOptions(bootServer, bootFile)
 	}
-	if pxeEnabled && len(macImages) > 0 {
+	srv.SetLegacyBootFile(legacy)
+	srv.SetUEFIBootFile(uefi)
+	srv.SetIPXEBootFile(ipxe)
+	if len(macImages) > 0 {
 		srv.SetMacPXEBootFiles(macImages)
 	}
 }
