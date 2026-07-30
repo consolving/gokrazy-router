@@ -200,6 +200,7 @@ password = "secret"
 
 func TestApplyExtras(t *testing.T) {
 	cfg := Default()
+	cfg.VLANs = []VLANConfig{{ID: 1, Name: "test"}}
 	cfg.Services.PXE.MacImages = map[string]string{
 		"00:00:00:00:00:00": "fallback.bin",
 	}
@@ -211,6 +212,8 @@ func TestApplyExtras(t *testing.T) {
 		MacImages: map[string]string{
 			"AA-BB-CC-DD-EE-FF": "netboot-arm.bin",
 		},
+		DefaultImage: "netboot.xyz.efi",
+		PXEBootFile:  "netboot.xyz.efi",
 	}
 	cfg.ApplyExtras(extras)
 
@@ -222,6 +225,15 @@ func TestApplyExtras(t *testing.T) {
 	}
 	if cfg.Services.PXE.MacImages["00:00:00:00:00:00"] != "fallback.bin" {
 		t.Error("existing PXE mac image overwritten")
+	}
+	if cfg.Services.PXE.DefaultImage != "netboot.xyz.efi" {
+		t.Errorf("DefaultImage = %q, want netboot.xyz.efi", cfg.Services.PXE.DefaultImage)
+	}
+	if cfg.VLANs[0].DHCP.PXEBootFile != "netboot.xyz.efi" {
+		t.Errorf("VLAN PXEBootFile = %q, want netboot.xyz.efi", cfg.VLANs[0].DHCP.PXEBootFile)
+	}
+	if cfg.WiFi.DHCP.PXEBootFile != "netboot.xyz.efi" {
+		t.Errorf("WiFi PXEBootFile = %q, want netboot.xyz.efi", cfg.WiFi.DHCP.PXEBootFile)
 	}
 }
 
@@ -287,9 +299,11 @@ func TestExtrasSaveLoad(t *testing.T) {
 	path := filepath.Join(dir, "extras.toml")
 
 	orig := &ExtrasConfig{
-		Reservations: map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
-		MacImages:    map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
-		SMBUsers:     []SMBUser{{Name: "backup", Password: "secret"}},
+		Reservations:  map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
+		MacImages:     map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
+		DefaultImage:  "netboot.xyz.efi",
+		PXEBootFile:   "netboot.xyz.efi",
+		SMBUsers:      []SMBUser{{Name: "backup", Password: "secret"}},
 	}
 	if err := orig.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -304,6 +318,12 @@ func TestExtrasSaveLoad(t *testing.T) {
 	}
 	if loaded.MacImages["11:22:33:44:55:66"] != "ubuntu.efi" {
 		t.Errorf("mac image mismatch: %s", loaded.MacImages["11:22:33:44:55:66"])
+	}
+	if loaded.DefaultImage != "netboot.xyz.efi" {
+		t.Errorf("DefaultImage = %q, want netboot.xyz.efi", loaded.DefaultImage)
+	}
+	if loaded.PXEBootFile != "netboot.xyz.efi" {
+		t.Errorf("PXEBootFile = %q, want netboot.xyz.efi", loaded.PXEBootFile)
 	}
 	if len(loaded.SMBUsers) != 1 || loaded.SMBUsers[0].Name != "backup" {
 		t.Errorf("smb users mismatch: %+v", loaded.SMBUsers)

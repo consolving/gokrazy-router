@@ -120,9 +120,11 @@ type PXEConfig struct {
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations map[string]string `toml:"reservations"` // MAC -> IP
-	MacImages    map[string]string `toml:"macImages"`    // MAC -> PXE image filename
-	SMBUsers     []SMBUser         `toml:"smbUsers"`     // additional SMB users
+	Reservations  map[string]string `toml:"reservations"`   // MAC -> IP
+	MacImages     map[string]string `toml:"macImages"`      // MAC -> PXE image filename
+	DefaultImage  string            `toml:"defaultImage"`   // PXE default image (overrides router.json)
+	PXEBootFile   string            `toml:"pxeBootFile"`    // DHCP option 67 bootfile (applied to all subnets)
+	SMBUsers      []SMBUser         `toml:"smbUsers"`       // additional SMB users
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -285,6 +287,16 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 			c.Services.PXE.MacImages = make(map[string]string)
 		}
 		c.Services.PXE.MacImages[normalizeMAC(mac)] = img
+	}
+	if extras.DefaultImage != "" {
+		c.Services.PXE.DefaultImage = extras.DefaultImage
+	}
+	if extras.PXEBootFile != "" {
+		for i := range c.VLANs {
+			c.VLANs[i].DHCP.PXEBootFile = extras.PXEBootFile
+		}
+		c.WiFi.DHCP.PXEBootFile = extras.PXEBootFile
+		c.LAN.DHCP.PXEBootFile = extras.PXEBootFile
 	}
 }
 
