@@ -418,12 +418,12 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 
 		classified := ""
 		switch {
-		case hasMacFile:
-			bootFile = macFile
-			classified = "mac"
 		case ipxe != "" && req != nil && isIPXEClient(req):
 			bootFile = ipxe
 			classified = "ipxe"
+		case hasMacFile:
+			bootFile = macFile
+			classified = "mac"
 		case uefi != "" && req != nil && isUEFIClient(req):
 			bootFile = uefi
 			classified = "uefi"

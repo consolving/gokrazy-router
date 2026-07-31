@@ -282,8 +282,8 @@ func TestPXEMACOverridePrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := bootfile(ipxeReq); got != "my-custom.ipxe" {
-		t.Errorf("iPXE client with MAC override bootfile = %q, want my-custom.ipxe", got)
+	if got := bootfile(ipxeReq); got != "boot.ipxe" {
+		t.Errorf("iPXE client with MAC override bootfile = %q, want boot.ipxe", got)
 	}
 
 	uefiReq, err := dhcpv4.New(dhcpv4.WithGeneric(dhcpv4.OptionClientSystemArchitectureType, []byte{0, 7}))
@@ -292,6 +292,14 @@ func TestPXEMACOverridePrecedence(t *testing.T) {
 	}
 	if got := bootfile(uefiReq); got != "my-custom.ipxe" {
 		t.Errorf("UEFI client with MAC override bootfile = %q, want my-custom.ipxe", got)
+	}
+
+	legacyReq, err := dhcpv4.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(legacyReq); got != "my-custom.ipxe" {
+		t.Errorf("legacy client with MAC override bootfile = %q, want my-custom.ipxe", got)
 	}
 }
 

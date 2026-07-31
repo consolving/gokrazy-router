@@ -229,19 +229,20 @@ Supported fields:
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE |
 
-DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. If `pxeBootServer`/`pxeBootFile` are set on a `dhcp` block, those values override the global `services.pxe` defaults for that scope.
+DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. Boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > bootFile/defaultImage`. If `pxeBootServer`/`pxeBootFile` are set on a `dhcp` block, those values override the global `services.pxe` defaults for that scope.
 
 #### Booting netboot.xyz
 
 To load the public [netboot.xyz](https://netboot.xyz) menu on legacy BIOS clients:
 
 1. Download `netboot.xyz.kpxe` into the TFTP root (e.g. `/mnt/data/tftpboot/netboot.xyz.kpxe`). This is the iPXE UNDI binary.
-2. Create a real iPXE script named `netboot.xyz.ipxe` that chainloads the netboot.xyz menu over HTTPS:
+2. Create a real iPXE script named `netboot.xyz.ipxe` that chainloads the netboot.xyz menu. Use `menu.ipxe` (the `ipxe/netboot.xyz.ipxe` path returns 404) and try HTTP first, because the legacy `undionly.kpxe` build has no HTTPS support:
 
    ```ipxe
    #!ipxe
-   chain --autofree https://boot.netboot.xyz/ipxe/netboot.xyz.ipxe ||
-   chain --autofree http://boot.netboot.xyz/ipxe/netboot.xyz.ipxe
+   chain --autofree http://boot.netboot.xyz/menu.ipxe ||
+   chain --autofree https://boot.netboot.xyz/menu.ipxe ||
+   shell
    ```
 
 3. Configure the router to hand out those files:
@@ -282,26 +283,7 @@ Reserve fixed IPs by MAC address in any `dhcp` block:
 
 ### Runtime extras config
 
-You can place a TOML file on the mounted disk and edit it with a text editor. The file is re-read on every gokrazy restart, so changes take effect when you restart the router service from the web UI.
-
-Example `/mnt/data/router-extras.toml`:
-
-```toml
-[reservations]
-"aa:bb:cc:dd:ee:ff" = "10.0.1.10"
-"11:22:33:44:55:66" = "10.0.1.11"
-
-[macImages]
-"aa:bb:cc:dd:ee:ff" = "netboot.xyz.kpxe"
-
-defaultImage = "netboot.xyz.kpxe"
-pxeBootFile = "netboot.xyz.kpxe"
-legacyBootFile = "netboot.xyz.kpxe"
-uefiBootFile = "netboot.xyz.efi"
-ipxeScript = "netboot.xyz.ipxe"
-```
-
-Point the JSON config at it:
+You can place a TOML file on the mounted disk and edit it with a text editor. The file is read on every gokrazy restart. If the file does not exist yet, a minimal initial version is created automatically from the JSON config (reservations, PXE images and VLAN addresses are seeded from `router.json`), so runtime editing always has a starting point. To apply edits without a reboot, `POST /api/reload` on the admin API (`:8080`).
 
 ```json
 "services": {
@@ -309,7 +291,51 @@ Point the JSON config at it:
 }
 ```
 
-A startup log line prints all active services, including extras-driven reservations and PXE images. Putting PXE boot files here is recommended because they change often and do not require a gokrazy redeploy.
+Supported keys:
+
+| Key | Purpose |
+|-----|---------|
+| `[reservations]` | `"mac" = "ip"` fixed leases, merged into every DHCP scope (VLANs, LAN, WiFi) |
+| `[macImages]` | `"mac" = "file"` per-MAC TFTP image (highest precedence) |
+| `defaultImage` | TFTP fallback for per-MAC requests that have no `macImages` entry |
+| `pxeBootFile` | DHCP option 67 boot file (applied to all subnets) |
+| `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
+| `uefiBootFile` | Option 67 for UEFI PXE clients |
+| `ipxeScript` | Option 67 once a client identifies itself as iPXE (option 77) |
+| `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes) |
+| `[[smbUsers]]` | Extra SMB users: `name`, `password` |
+
+The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
+
+Example covering all interfaces (VLAN 1, 20, 31 and WiFi), a per-MAC PXE image and an extra SMB user:
+
+```toml
+[vlanAddresses]
+1  = "10.0.1.1/24"
+20 = "10.0.20.1/24"
+31 = "10.0.31.1/24"
+
+[reservations]
+"5c:ff:35:0d:b3:49" = "10.0.31.150"   # T410i on VLAN 31
+"aa:bb:cc:dd:ee:01" = "10.0.1.10"     # workstation on VLAN 1
+"aa:bb:cc:dd:ee:02" = "10.0.20.20"    # NAS on VLAN 20
+"cc:dd:ee:ff:00:11" = "10.0.31.100"   # WiFi client
+
+[macImages]
+"5c:ff:35:0d:b3:49" = "undionly.kpxe"      # T410i: legacy iPXE UNDI
+"aa:bb:cc:dd:ee:01" = "ipxe-workstation.efi" # UEFI workstation
+
+pxeBootFile = "netboot.xyz.efi"       # default for UEFI clients
+legacyBootFile = "netboot.xyz.efi"    # legacy clients default here too (only MAC-mapped clients get a working legacy chain)
+uefiBootFile = "netboot.xyz.efi"
+ipxeScript = "boot.ipxe"               # iPXE clients get a script
+
+[[smbUsers]]
+name = "alice"
+password = "hunter2"
+```
+
+A startup log line prints all active services, including extras-driven reservations and PXE images. Putting PXE boot files here is recommended because they change often and do not require a gokrazy redeploy. Do not put SMB credentials or other secrets in the JSON config; `smbUsers` belongs in `router-extras.toml` on the mounted disk.
 
 ## Deployment
 
@@ -345,15 +371,16 @@ If PXE is enabled, mount a disk and place boot artifacts in the configured TFTP 
 
 ```bash
 mkdir -p /mnt/data/tftpboot
-curl -L -o /mnt/data/tftpboot/netboot.xyz.kpxe \
-  https://github.com/netbootxyz/netboot.xyz/releases/latest/download/netboot.xyz.kpxe
+curl -L -o /mnt/data/tftpboot/undionly.kpxe \
+  https://boot.ipxe.org/undionly.kpxe
 curl -L -o /mnt/data/tftpboot/netboot.xyz.efi \
   https://github.com/netbootxyz/netboot.xyz/releases/latest/download/netboot.xyz.efi
 cp netboot/netboot.xyz.ipxe /mnt/data/tftpboot/netboot.xyz.ipxe
+cp netboot/boot.ipxe /mnt/data/tftpboot/boot.ipxe
 cp netboot/router-extras.toml /mnt/data/router-extras.toml
 ```
 
-The runtime extras file selects `netboot.xyz.kpxe` for legacy clients and `netboot.xyz.ipxe` for iPXE clients (see [PXE/TFTP server](#pxetftp-server)). Do not put SMB credentials or other secrets in this file.
+The shipped `netboot/router-extras.toml` sends the T410i (legacy BIOS) through the iPXE chain (`undionly.kpxe` → `boot.ipxe` → netboot.xyz) and defaults every other client to the UEFI bootloader `netboot.xyz.efi` (see [Runtime extras config](#runtime-extras-config)). Do not put SMB credentials or other secrets in this file.
 
 See [`netboot/gokrazy-router.json`](netboot/gokrazy-router.json) for a complete config example.
 

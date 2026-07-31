@@ -52,10 +52,12 @@ func main() {
 
 	// Load optional extras file from the mounted volume. It overrides/extends
 	// reservations, PXE images and SMB users. Reload happens on every restart.
+	// If no extras file exists yet, a minimal one is created from the JSON
+	// config so reservations/PXE settings can be edited at runtime.
 	var extras *config.ExtrasConfig
 	if cfg.Services.ExtrasFile != "" {
 		var err error
-		extras, err = config.LoadExtras(cfg.Services.ExtrasFile)
+		extras, err = loadOrCreateExtras(cfg.Services.ExtrasFile, cfg)
 		if err != nil {
 			log.Printf("extras: %v (continuing without)", err)
 		} else {
@@ -412,21 +414,11 @@ func main() {
 			return
 		}
 
-		extras, err := config.LoadExtras(cfg.Services.ExtrasFile)
+		extras, err := loadOrCreateExtras(cfg.Services.ExtrasFile, cfg)
 		if err != nil {
-			if os.IsNotExist(err) {
-				extras = config.ExtrasFromConfig(cfg)
-				if err := extras.Save(cfg.Services.ExtrasFile); err != nil {
-					log.Printf("reload: create extras: %v", err)
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				log.Printf("reload: created %s from config", cfg.Services.ExtrasFile)
-			} else {
-				log.Printf("reload: %v", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
+			log.Printf("reload: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		cfg.ApplyExtras(extras)
@@ -494,6 +486,24 @@ func main() {
 	}
 }
 
+// loadOrCreateExtras loads the runtime extras file, creating a minimal
+// initial version from the JSON config when the file does not exist yet.
+func loadOrCreateExtras(path string, cfg *config.Config) (*config.ExtrasConfig, error) {
+	extras, err := config.LoadExtras(path)
+	if err == nil {
+		return extras, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	extras = config.ExtrasFromConfig(cfg)
+	if err := extras.Save(path); err != nil {
+		return nil, fmt.Errorf("create extras: %w", err)
+	}
+	log.Printf("extras: created %s from config", path)
+	return extras, nil
+}
+
 func applyDHCPOptions(srv *dhcp.Server, dhcpcfg config.DHCPConfig, pxeEnabled bool, tftpServer string, macImages map[string]string, pxeCfg config.PXEConfig) {
 	if len(dhcpcfg.Reservations) > 0 {
 		srv.SetReservations(dhcpcfg.Reservations)
@@ -522,7 +532,7 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 		bootFile = pxeCfg.DefaultImage
 	}
 	if bootFile == "" {
-		bootFile = "undionly.kpxe"
+		bootFile = "netboot.xyz.efi"
 	}
 	legacy := pxeCfg.LegacyBootFile
 	if legacy == "" {
