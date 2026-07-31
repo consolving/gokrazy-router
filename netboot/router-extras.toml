@@ -4,6 +4,10 @@
 #
 # This file is re-read on every gokrazy router restart, so changes to
 # reservations, PXE images, and boot files take effect without redeploying.
+# POST /api/reload (Authorization: Bearer <token>, see services.adminAPI)
+# applies reservations + PXE settings live without a restart. Changes to
+# [vlanAddresses] and [[smbUsers]] require a router restart and are
+# rejected by /api/reload with HTTP 409.
 
 # Static DHCP reservations (MAC -> IP). Only applied to the matching subnet.
 [reservations]

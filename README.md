@@ -10,7 +10,7 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **Inter-VLAN isolation** — VLANs marked `isolated` are firewalled from all other VLANs (internet-only)
 - **WiFi access point** — Runs the onboard RTL8192CU as an AP via a bundled `hostapd` binary, with automatic restart on crash (exponential backoff)
 - **WiFi + LAN shared subnet** — WiFi and a LAN port can share a subnet (split into two /25 ranges), with the router forwarding between them
-- **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on `:8080`
+- **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on the admin listener (loopback `127.0.0.1:8080` by default)
 - **PXE/TFTP boot server** — Serve boot images to PXE clients with a single TFTP server. DHCP automatically injects options 66/67 and selects the boot file by client type: legacy BIOS, UEFI, or iPXE (via DHCP option 77). Serve kernels, initrds, and iPXE binaries/scripts from a configurable TFTP root.
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
 - **Status CLI** — `router-cli` queries the API and prints port/client tables
@@ -197,7 +197,7 @@ A statically linked `smbd` (and `smbpasswd`) must be bundled via ExtraFilePaths,
 
 ### PXE/TFTP server
 
-Serve boot images to PXE clients. The TFTP server listens on UDP/69. Its root directory defaults to `<mountTarget>/tftpboot`. The TFTP root is a strict jail: requests for absolute paths, `..` traversal or symlinks that resolve outside the root are rejected with a TFTP error, so a client cannot read arbitrary files from the router. Each transfer runs on its own ephemeral UDP port (standard TFTP transfer ID), which keeps concurrent clients isolated.
+Serve boot images to PXE clients. The TFTP server listens on UDP/69. Its root directory defaults to `<mountTarget>/tftpboot`. The TFTP root is a strict jail: requests for absolute paths, `..` traversal or symlinks that resolve outside the root are rejected with a TFTP error, and every path component is opened with no-follow semantics so a symlink swapped in between validation and open cannot escape the root — a client cannot read arbitrary files from the router. Each transfer runs on its own ephemeral UDP port (standard TFTP transfer ID), which keeps concurrent clients isolated.
 
 For a working iPXE chain, place the iPXE UNDI binary (e.g. `undionly.kpxe`) and a real iPXE text script named `boot.ipxe` into the TFTP root. The DHCP server sends `undionly.kpxe` to the initial PXE ROM and `boot.ipxe` once iPXE identifies itself via DHCP option 77 (User Class). If both names point to the same file, iPXE will reload itself in a loop.
 
@@ -284,7 +284,7 @@ Reserve fixed IPs by MAC address in any `dhcp` block:
 
 ### Runtime extras config
 
-You can place a TOML file on the mounted disk and edit it with a text editor. The file is read on every gokrazy restart. If the file does not exist yet, a minimal initial version is created automatically from the JSON config (reservations, PXE images and VLAN addresses are seeded from `router.json`), so runtime editing always has a starting point. To apply edits without a reboot, `POST /api/reload` on the admin API (`:8080`).
+You can place a TOML file on the mounted disk and edit it with a text editor. The file is read on every gokrazy restart. If the file does not exist yet, a minimal initial version is created automatically from the JSON config (reservations, PXE images and VLAN addresses are seeded from `router.json`), so runtime editing always has a starting point. To apply edits without a reboot, `POST /api/reload` on the admin API (default `127.0.0.1:8080`, see [Admin API](#admin-api)).
 
 ```json
 "services": {
@@ -303,10 +303,30 @@ Supported keys:
 | `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE (option 77) |
-| `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes) |
-| `[[smbUsers]]` | Extra SMB users: `name`, `password` |
+| `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes). Applying changes requires a router restart — `/api/reload` rejects them with HTTP 409 |
+| `[[smbUsers]]` | Extra SMB users: `name`, `password`. Granted access at startup; adding/removing users requires a router restart — `/api/reload` rejects the change with HTTP 409 |
 
 The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. This is deliberate: once a client runs iPXE, its `ipxeScript` must win over the MAC mapping or the client would never leave the initial boot loader. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
+
+### Admin API
+
+The HTTP admin API (default `127.0.0.1:8080`) serves the JSON status endpoint at `/status` and the reload endpoint at `/api/reload`. Both share one listener, so the status page is no longer exposed on all interfaces by default — set `services.adminAPI.listen` to `:8080` to restore the old behavior, or to another address/port to move the API elsewhere.
+
+```json
+"services": {
+  "adminAPI": {
+    "listen": "127.0.0.1:8080",
+    "token": "CHANGE_ME",
+    "allowUnauthenticatedReload": false
+  }
+}
+```
+
+- `listen` — bind address for the status + admin API (default `127.0.0.1:8080`).
+- `token` — bearer token required for `POST /api/reload`. Any header is compared in constant time; missing or wrong token yields `401 Unauthorized`.
+- `allowUnauthenticatedReload` — set `true` to allow reloads without a token. Only do this on a trusted network, and prefer a `token` plus SSH or a host firewall to reach it.
+
+`POST /api/reload` re-reads the extras file and applies reservations and PXE settings live, then answers `200 ok`. Changes that require a full restart — `[vlanAddresses]` edits or adding/removing `[[smbUsers]]` — are rejected with `409 Conflict` rather than silently half-applied; restart the router to pick those up. The admin listener is unauthenticated for `/status` by design; it binds to loopback so remote clients cannot read it. Always set a `token` (or keep the listener loopback-only) if the router is reachable from untrusted networks.
 
 The extras file replaces (does not merge with) the base `services.pxe` overrides while it is present: `macImages`, `defaultImage`, `pxeBootFile`, `legacyBootFile`, `uefiBootFile` and `ipxeScript` from the JSON config are ignored once an extras file is in place. Values removed from the TOML file are removed at runtime as well — set `defaultImage = ""` to clear it. When the extras file does not exist yet, it is auto-created and seeded from `router.json`, so nothing is lost until the file is edited.
 
@@ -412,7 +432,7 @@ Both `linux/arm` (ARMv7) and `linux/amd64` are supported build targets.
 
 ## Status API
 
-The daemon serves a JSON status endpoint at `http://<router-ip>:8080/status` with port statistics and per-client traffic counters.
+The daemon serves a JSON status endpoint at `http://127.0.0.1:8080/status` (on the router itself) with port statistics and per-client traffic counters. Configure `services.adminAPI.listen` to expose it on another interface.
 
 Use the CLI tool to query it:
 

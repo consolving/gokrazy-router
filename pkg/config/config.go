@@ -80,10 +80,23 @@ type WiFiConfig struct {
 
 // ServicesConfig groups optional add-on services that are not part of the core router.
 type ServicesConfig struct {
-	Mount      MountConfig `json:"mount,omitempty"`
-	SMB        SMBConfig   `json:"smb,omitempty"`
-	PXE        PXEConfig   `json:"pxe,omitempty"`
-	ExtrasFile string      `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
+	Mount      MountConfig    `json:"mount,omitempty"`
+	SMB        SMBConfig      `json:"smb,omitempty"`
+	PXE        PXEConfig      `json:"pxe,omitempty"`
+	ExtrasFile string         `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
+	AdminAPI   AdminAPIConfig `json:"adminAPI,omitempty"`
+}
+
+// AdminAPIConfig controls the administration HTTP API (/status, /api/reload).
+// The listener defaults to 127.0.0.1:8080 so state-changing endpoints are not
+// reachable from other router subnets unless explicitly exposed.
+type AdminAPIConfig struct {
+	Listen string `json:"listen,omitempty"` // default: 127.0.0.1:8080
+	Token  string `json:"token,omitempty"`  // if set, Bearer token required for /api/reload
+	// AllowUnauthenticatedReload is an explicit opt-in for home-lab deployments
+	// that want to trigger reloads without a token. The trust boundary is the
+	// AdminAPI.Listen address; keep it bound to a management interface.
+	AllowUnauthenticatedReload bool `json:"allowUnauthenticatedReload,omitempty"`
 }
 
 // MountConfig describes a block device to mount before optional services start.
@@ -275,6 +288,8 @@ func (c *Config) ExpandEnv() {
 	}
 
 	c.Services.ExtrasFile = e(c.Services.ExtrasFile)
+	c.Services.AdminAPI.Listen = e(c.Services.AdminAPI.Listen)
+	c.Services.AdminAPI.Token = e(c.Services.AdminAPI.Token)
 }
 
 // ApplyExtras merges ExtrasConfig into the loaded config.

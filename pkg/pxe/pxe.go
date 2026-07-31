@@ -244,16 +244,16 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 	defer s.active.Delete(key)
 	defer st.abort()
 
-	img, err := s.resolvePath(root, filename)
+	rootReal, rel, err := s.resolvePath(root, filename)
 	if err != nil {
 		log.Printf("pxe: %s: %v", filename, err)
 		sendERR(control, st.client, 1, "File not found")
 		return
 	}
 
-	f, err := os.Open(img)
+	f, err := openTFTPFile(rootReal, rel)
 	if err != nil {
-		log.Printf("pxe: cannot open %s: %v", img, err)
+		log.Printf("pxe: cannot open %s: %v", filename, err)
 		sendERR(control, st.client, 1, "File not found")
 		return
 	}
@@ -264,13 +264,13 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 	// transfer IDs work and what isolates concurrent transfers from each other.
 	conn, err := s.listenTransfer(st.client)
 	if err != nil {
-		log.Printf("pxe: transfer socket for %s: %v", img, err)
+		log.Printf("pxe: transfer socket for %s: %v", filename, err)
 		sendERR(control, st.client, 1, "Server error")
 		return
 	}
 	defer conn.Close()
 
-	log.Printf("pxe: sending %s (requested %s) via %s", img, filename, conn.LocalAddr())
+	log.Printf("pxe: sending %s (requested %s) via %s", rel, filename, conn.LocalAddr())
 
 	block := uint16(1)
 	data := make([]byte, 4+tftpBlockSize)
@@ -297,7 +297,7 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 		}
 
 		if n < tftpBlockSize {
-			log.Printf("pxe: completed %s (%d blocks)", img, int(block))
+			log.Printf("pxe: completed %s (%d blocks)", rel, int(block))
 			return
 		}
 		block++
@@ -312,16 +312,13 @@ func (s *Server) listenTransfer(client *net.UDPAddr) (*net.UDPConn, error) {
 }
 
 // sendBlock transmits one DATA block and waits for the matching ACK,
-// retransmitting on timeout. The final (short) block is sent without waiting
-// for an ACK, as permitted by RFC 1350.
+// retransmitting on timeout. RFC 1350 requires clients to ACK the final
+// (short) block too, so the same retry logic is applied to it: losing the
+// last block silently terminated the transfer otherwise.
 func sendBlock(conn *net.UDPConn, st *transfer, data []byte, block uint16) error {
-	last := len(data) < 4+tftpBlockSize
 	for i := 0; i < tftpRetries; i++ {
 		if _, err := conn.WriteToUDP(data, st.client); err != nil {
 			return err
-		}
-		if last {
-			return nil
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(tftpTimeout)); err != nil {
@@ -400,33 +397,73 @@ func (s *Server) resolveImage(filename string) string {
 	return filename
 }
 
-// resolvePath turns a TFTP request filename into a path inside root. The TFTP
-// root is a strict jail: absolute paths, parent-directory traversal and
-// symlinks escaping the root are rejected, for the requested filename as well
-// as for names resolved through macImages/DefaultImage.
-func (s *Server) resolvePath(root, filename string) (string, error) {
+// resolvePath turns a TFTP request filename into the real root directory and a
+// cleaned relative path inside it. The TFTP root is a strict jail: absolute
+// paths, parent-directory traversal and symlinks escaping the root are
+// rejected, for the requested filename as well as for names resolved through
+// macImages/DefaultImage.
+func (s *Server) resolvePath(root, filename string) (rootReal, rel string, err error) {
 	img := s.resolveImage(filename)
 	if filepath.IsAbs(img) {
-		return "", fmt.Errorf("absolute path rejected: %q", img)
+		return "", "", fmt.Errorf("absolute path rejected: %q", img)
 	}
 
 	full := filepath.Join(root, img)
 	if !pathWithinRoot(root, full) {
-		return "", fmt.Errorf("path escapes TFTP root: %q", img)
+		return "", "", fmt.Errorf("path escapes TFTP root: %q", img)
 	}
 
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return "", fmt.Errorf("resolve root %q: %w", root, err)
+		return "", "", fmt.Errorf("resolve root %q: %w", root, err)
 	}
 	realFull, err := filepath.EvalSymlinks(full)
 	if err != nil {
-		return "", fmt.Errorf("open %q: %w", img, err)
+		return "", "", fmt.Errorf("open %q: %w", img, err)
 	}
 	if !pathWithinRoot(realRoot, realFull) {
-		return "", fmt.Errorf("symlink escapes TFTP root: %q", img)
+		return "", "", fmt.Errorf("symlink escapes TFTP root: %q", img)
 	}
-	return realFull, nil
+	rel, err = filepath.Rel(realRoot, realFull)
+	if err != nil {
+		return "", "", fmt.Errorf("rel %q: %w", img, err)
+	}
+	return realRoot, rel, nil
+}
+
+// openTFTPFile opens rel inside rootDir component-by-component using openat
+// with O_NOFOLLOW on every component. Opening relative to the already-resolved
+// root descriptor makes the jail immune to a post-validation symlink swap
+// (TOCTOU): any path component that becomes a symlink after validation is
+// rejected at open time instead of being followed outside the root.
+func openTFTPFile(rootDir, rel string) (*os.File, error) {
+	dirfd, err := unix.Open(rootDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			unix.Close(dirfd)
+			return nil, fmt.Errorf("invalid path component %q", part)
+		}
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		if i < len(parts)-1 {
+			flags |= unix.O_DIRECTORY
+		}
+		fd, err := unix.Openat(dirfd, part, flags, 0)
+		if err != nil {
+			unix.Close(dirfd)
+			return nil, err
+		}
+		unix.Close(dirfd)
+		dirfd = fd
+		if i == len(parts)-1 {
+			return os.NewFile(uintptr(fd), part), nil
+		}
+	}
+	unix.Close(dirfd)
+	return nil, fmt.Errorf("empty path")
 }
 
 func pathWithinRoot(root, full string) bool {

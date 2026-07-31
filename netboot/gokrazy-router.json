@@ -43,6 +43,10 @@
       "listen": "0.0.0.0:69",
       "tftpRoot": "/mnt/data/tftpboot"
     },
-    "extrasFile": "/mnt/data/router-extras.toml"
+    "extrasFile": "/mnt/data/router-extras.toml",
+    "adminAPI": {
+      "listen": "127.0.0.1:8080",
+      "token": "CHANGE_ME"
+    }
   }
 }

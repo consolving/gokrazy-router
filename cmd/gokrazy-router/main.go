@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/subtle"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,7 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +30,15 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// dhcpEntry ties one running DHCP server to the reservations from router.json
+// for its scope. baseScope points into the immutable base config snapshot;
+// reloads merge it with the extras file so base-JSON reservations survive.
+type dhcpEntry struct {
+	srv       *dhcp.Server
+	tftpAddr  string
+	baseScope *config.DHCPConfig
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/gokrazy-router.json", "path to configuration file")
 	flag.Parse()
@@ -41,6 +54,12 @@ func main() {
 
 	// Expand ${ENV} references in service configuration.
 	cfg.ExpandEnv()
+
+	// Immutable snapshot of the base JSON config, taken before any extras are
+	// merged. Reloads derive effective per-scope state (e.g. reservations)
+	// from this snapshot plus the current extras file, instead of mutating
+	// cfg cumulatively.
+	base := cloneConfig(cfg)
 
 	// 0. Optional: mount a disk used by SMB/PXE/extras config.
 	if cfg.Services.Mount.Enabled {
@@ -171,10 +190,6 @@ func main() {
 	}
 
 	// Collect running services for config reload.
-	type dhcpEntry struct {
-		srv      *dhcp.Server
-		tftpAddr string
-	}
 	var dhcpEntries []dhcpEntry
 
 	var activeServices []string
@@ -243,7 +258,8 @@ func main() {
 
 	// 6. Start DHCP servers.
 	if vlanMode {
-		for _, vc := range cfg.VLANs {
+		for i := range cfg.VLANs {
+			vc := cfg.VLANs[i]
 			if !vc.DHCP.Enabled {
 				continue
 			}
@@ -259,7 +275,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("dhcp vlan %d: %v", vc.ID, err)
 			}
-			dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(vc.Address)})
+			dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(vc.Address), baseScope: &base.VLANs[i].DHCP})
 			applyDHCPOptions(srv, vc.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(vc.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 			if mon != nil {
 				vlanName := vc.Name
@@ -298,7 +314,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp: %v", err)
 		}
-		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.LAN.Address)})
+		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.LAN.Address), baseScope: &base.LAN.DHCP})
 		applyDHCPOptions(srv, cfg.LAN.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.LAN.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
@@ -333,7 +349,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("dhcp wifi: %v", err)
 		}
-		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.WiFi.Address)})
+		dhcpEntries = append(dhcpEntries, dhcpEntry{srv: srv, tftpAddr: ifaceIPFromCIDR(cfg.WiFi.Address), baseScope: &base.WiFi.DHCP})
 		applyDHCPOptions(srv, cfg.WiFi.DHCP, cfg.Services.PXE.Enabled, ifaceIPFromCIDR(cfg.WiFi.Address), cfg.Services.PXE.MacImages, cfg.Services.PXE)
 		if mon != nil {
 			srv.OnLease(func(ip net.IP, mac string) {
@@ -359,17 +375,13 @@ func main() {
 	var smbServer *smb.Server
 	if cfg.Services.SMB.Enabled {
 		smbServer = smb.New(cfg.Services.SMB)
+		if extras != nil {
+			smbServer.SetExtraUsers(extras.SMBUsers)
+		}
 		if err := smbServer.Start(); err != nil {
 			log.Printf("smb: %v (continuing without SMB)", err)
 		} else {
 			activeServices = append(activeServices, fmt.Sprintf("SMB(%s@%s)", cfg.Services.SMB.ShareName, cfg.Services.SMB.Listen))
-			if extras != nil {
-				for _, u := range extras.SMBUsers {
-					if err := smbServer.AddUser(u.Name, u.Password); err != nil {
-						log.Printf("smb: add extras user %s: %v", u.Name, err)
-					}
-				}
-			}
 		}
 	}
 
@@ -391,6 +403,15 @@ func main() {
 	}
 
 	// 10. Start administration HTTP API.
+	rel := &reloader{
+		cfg:             cfg,
+		base:            base,
+		extrasPath:      cfg.Services.ExtrasFile,
+		dhcpEntries:     dhcpEntries,
+		pxeSrv:          pxeSrv,
+		appliedSMBUsers: extrasSMBUsers(extras),
+	}
+
 	if mon != nil {
 		http.Handle("/status", mon)
 	}
@@ -399,49 +420,46 @@ func main() {
 			http.Error(w, "use POST", http.StatusMethodNotAllowed)
 			return
 		}
-
-		extras, err := loadOrCreateExtras(cfg.Services.ExtrasFile, cfg)
-		if err != nil {
+		if !cfg.Services.AdminAPI.AllowUnauthenticatedReload {
+			tok := cfg.Services.AdminAPI.Token
+			if tok == "" {
+				http.Error(w, "reload disabled: set services.adminAPI.token or services.adminAPI.allowUnauthenticatedReload", http.StatusUnauthorized)
+				return
+			}
+			expected := []byte("Bearer " + tok)
+			got := []byte(r.Header.Get("Authorization"))
+			if len(got) != len(expected) || subtle.ConstantTimeCompare(got, expected) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		if err := rel.Reload(); err != nil {
 			log.Printf("reload: %v", err)
+			var restartErr *restartRequiredError
+			if errors.As(err, &restartErr) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		cfg.ApplyExtras(extras)
-
-		for _, e := range dhcpEntries {
-			e.srv.SetReservations(extras.Reservations)
-			bs := ""
-			if cfg.Services.PXE.Enabled {
-				bs = e.tftpAddr
-			}
-			applyPXEBootOptions(e.srv, cfg.Services.PXE.Enabled, bs, cfg.Services.PXE.MacImages, cfg.Services.PXE)
-		}
-
-		if pxeSrv != nil {
-			pxeSrv.SetMacImages(extras.MacImages)
-			pxeSrv.SetDefaultImage(extras.DefaultImage)
-		}
-
-		if smbServer != nil {
-			for _, u := range extras.SMBUsers {
-				if err := smbServer.AddUser(u.Name, u.Password); err != nil {
-					log.Printf("reload: smb add user %s: %v", u.Name, err)
-				}
-			}
-		}
-
-		log.Printf("reload: extras reloaded from %s", cfg.Services.ExtrasFile)
 		fmt.Fprintln(w, "ok")
 	})
 	go func() {
-		addr := ":8080"
+		addr := cfg.Services.AdminAPI.Listen
+		if addr == "" {
+			addr = "127.0.0.1:8080"
+		}
 		log.Printf("HTTP API listening on %s", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Printf("HTTP API: %v", err)
 		}
 	}()
-	activeServices = append(activeServices, "HTTP:8080")
+	adminAddr := cfg.Services.AdminAPI.Listen
+	if adminAddr == "" {
+		adminAddr = "127.0.0.1:8080"
+	}
+	activeServices = append(activeServices, "HTTP:"+adminAddr)
 
 	if len(activeServices) > 0 {
 		log.Printf("gokrazy-router running with active services: %s", strings.Join(activeServices, ", "))
@@ -468,6 +486,161 @@ func main() {
 	if natMgr != nil {
 		natMgr.Cleanup()
 	}
+}
+
+// restartRequiredError reports an extras change that cannot be applied to the
+// running daemon and requires a restart (e.g. VLAN address overrides).
+type restartRequiredError struct {
+	msg string
+}
+
+func (e *restartRequiredError) Error() string { return e.msg }
+
+// reloader applies the extras file to the running services. Reloads are
+// serialized: Config.ApplyExtras mutates the shared cfg, and concurrent
+// requests would otherwise race on it.
+type reloader struct {
+	mu sync.Mutex
+
+	cfg             *config.Config // live config, mutated by ApplyExtras
+	base            *config.Config // immutable snapshot from router.json
+	extrasPath      string
+	dhcpEntries     []dhcpEntry
+	pxeSrv          *pxe.Server
+	appliedSMBUsers []config.SMBUser // user list smbd was started with
+}
+
+// Reload re-reads the extras file and applies it to DHCP, PXE and (where
+// supported) SMB. Changes that require reconfiguring live network/DHCP/NAT
+// state or restarting Samba are rejected with a restartRequiredError.
+func (r *reloader) Reload() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.extrasPath == "" {
+		return fmt.Errorf("no services.extrasFile configured")
+	}
+	extras, err := loadOrCreateExtras(r.extrasPath, r.cfg)
+	if err != nil {
+		return fmt.Errorf("load extras: %w", err)
+	}
+
+	if err := r.checkRestartRequired(extras); err != nil {
+		return err
+	}
+
+	r.cfg.ApplyExtras(extras)
+
+	for _, e := range r.dhcpEntries {
+		// Effective reservations = base-JSON reservations for this scope
+		// merged with the extras map. SetReservations filters by the server's
+		// own subnet, so per-scope base reservations are preserved across
+		// reloads instead of being replaced by the raw extras map.
+		res := mergedReservations(e.baseScope.Reservations, extras.Reservations)
+		e.srv.SetReservations(res)
+		bs := ""
+		if r.cfg.Services.PXE.Enabled {
+			bs = e.tftpAddr
+		}
+		applyPXEBootOptions(e.srv, r.cfg.Services.PXE.Enabled, bs, r.cfg.Services.PXE.MacImages, r.cfg.Services.PXE)
+	}
+
+	if r.pxeSrv != nil {
+		r.pxeSrv.SetMacImages(extras.MacImages)
+		r.pxeSrv.SetDefaultImage(extras.DefaultImage)
+	}
+
+	log.Printf("reload: extras reloaded from %s", r.extrasPath)
+	return nil
+}
+
+// checkRestartRequired rejects extras changes that cannot be applied to the
+// running daemon safely.
+func (r *reloader) checkRestartRequired(extras *config.ExtrasConfig) error {
+	// VLAN address overrides change the bridge, DHCP server and NAT state.
+	// Those are set up once at boot; applying an override at runtime would
+	// leave the live network and DHCP server on the old addresses. Require a
+	// restart instead.
+	for id, addr := range extras.VLANAddresses {
+		for i := range r.cfg.VLANs {
+			if r.cfg.VLANs[i].ID != id {
+				continue
+			}
+			if addr != r.cfg.VLANs[i].Address {
+				return &restartRequiredError{msg: fmt.Sprintf(
+					"vlanAddresses[%d] changed from %s to %s: VLAN address changes require a router restart", r.cfg.VLANs[i].ID, r.cfg.VLANs[i].Address, addr)}
+			}
+			break
+		}
+	}
+	// SMB user-list changes cannot be applied at runtime: valid users and the
+	// password database are baked into smb.conf when smbd starts.
+	if !equalSMBUsers(r.appliedSMBUsers, extras.SMBUsers) {
+		return &restartRequiredError{msg: "smbUsers changed: SMB user changes require a router restart"}
+	}
+	return nil
+}
+
+// mergedReservations returns base merged with extras; extras win on conflict.
+func mergedReservations(base, extras map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(extras))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extras {
+		out[k] = v
+	}
+	return out
+}
+
+// extrasSMBUsers returns a stable copy of the extras SMB user list.
+func extrasSMBUsers(extras *config.ExtrasConfig) []config.SMBUser {
+	if extras == nil {
+		return nil
+	}
+	return append([]config.SMBUser(nil), extras.SMBUsers...)
+}
+
+func equalSMBUsers(a, b []config.SMBUser) bool {
+	return smbUsersKey(a) == smbUsersKey(b)
+}
+
+func smbUsersKey(users []config.SMBUser) string {
+	parts := make([]string, len(users))
+	for i, u := range users {
+		parts[i] = u.Name + ":" + u.Password
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x00")
+}
+
+// cloneConfig deep-copies the maps that ApplyExtras mutates, so the base
+// snapshot stays pristine for later reloads.
+func cloneConfig(c *config.Config) *config.Config {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.LAN.DHCP.Reservations = cloneStringMap(c.LAN.DHCP.Reservations)
+	out.WiFi.DHCP.Reservations = cloneStringMap(c.WiFi.DHCP.Reservations)
+	out.VLANs = make([]config.VLANConfig, len(c.VLANs))
+	for i := range c.VLANs {
+		out.VLANs[i] = c.VLANs[i]
+		out.VLANs[i].DHCP.Reservations = cloneStringMap(c.VLANs[i].DHCP.Reservations)
+	}
+	out.Services.PXE.MacImages = cloneStringMap(c.Services.PXE.MacImages)
+	return &out
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // loadOrCreateExtras loads the runtime extras file, creating a minimal

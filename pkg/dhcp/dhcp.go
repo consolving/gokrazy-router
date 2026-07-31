@@ -285,6 +285,10 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover:
 		ip := s.allocate(mac)
+		if ip == nil {
+			log.Printf("dhcp: pool exhausted, no free address for %s", mac)
+			return
+		}
 		resp, err = dhcpv4.NewReplyFromRequest(req,
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeOffer),
 			dhcpv4.WithServerIP(s.serverIP),
@@ -298,6 +302,10 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		)
 	case dhcpv4.MessageTypeRequest:
 		ip := s.allocate(mac)
+		if ip == nil {
+			log.Printf("dhcp: pool exhausted, no free address for %s", mac)
+			return
+		}
 		resp, err = dhcpv4.NewReplyFromRequest(req,
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
 			dhcpv4.WithServerIP(s.serverIP),
@@ -356,17 +364,24 @@ func (s *Server) allocate(mac string) net.IP {
 		return l.IP
 	}
 
-	// Find next free IP.
-	ip := dupIP(s.nextIP)
+	// Find next free IP. Scan until we complete a full pool cycle; if every
+	// address is leased or reserved, allocation must fail rather than hand out
+	// a duplicate.
+	start := dupIP(s.nextIP)
+	ip := start
 	for {
 		if !s.isLeasedOrReserved(ip) {
 			break
 		}
-		ip = incIP(ip)
-		if ip.Equal(s.rangeEnd) || ipGreater(ip, s.rangeEnd) {
-			ip = dupIP(s.rangeStart) // wrap around
-			break
+		next := incIP(ip)
+		if ipGreater(next, s.rangeEnd) {
+			next = dupIP(s.rangeStart)
 		}
+		if next.Equal(start) {
+			// Full pool cycle completed without finding a free address.
+			return nil
+		}
+		ip = next
 	}
 
 	s.leases[mac] = lease{IP: dupIP(ip), Expires: time.Now().Add(s.lease)}

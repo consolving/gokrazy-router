@@ -182,6 +182,86 @@ func TestSetReservationsAndAllocate(t *testing.T) {
 	}
 }
 
+// TestAllocatePoolExhausted verifies that a fully occupied pool returns nil
+// instead of wrapping around and handing out a duplicate address.
+func TestAllocatePoolExhausted(t *testing.T) {
+	newSrv := func() *Server {
+		return &Server{
+			iface:      "eth0",
+			serverIP:   net.ParseIP("10.0.0.1").To4(),
+			mask:       net.CIDRMask(24, 32),
+			rangeStart: net.ParseIP("10.0.0.100").To4(),
+			rangeEnd:   net.ParseIP("10.0.0.102").To4(), // 3-address pool
+			dns:        []net.IP{net.ParseIP("8.8.8.8").To4()},
+			lease:      1 * time.Hour,
+			router:     net.ParseIP("10.0.0.1").To4(),
+			leases:     make(map[string]lease),
+			nextIP:     dupIP(net.ParseIP("10.0.0.101").To4()),
+		}
+	}
+
+	t.Run("reservations fill pool", func(t *testing.T) {
+		s := newSrv()
+		s.SetReservations(map[string]string{
+			"00:11:22:33:44:01": "10.0.0.100",
+			"00:11:22:33:44:02": "10.0.0.101",
+			"00:11:22:33:44:03": "10.0.0.102",
+		})
+		if ip := s.allocate("00:11:22:33:44:99"); ip != nil {
+			t.Fatalf("pool exhausted but allocated %s", ip)
+		}
+	})
+
+	t.Run("dynamic leases fill pool", func(t *testing.T) {
+		s := newSrv()
+		for _, mac := range []string{"00:11:22:33:44:a1", "00:11:22:33:44:a2", "00:11:22:33:44:a3"} {
+			if ip := s.allocate(mac); ip == nil {
+				t.Fatalf("allocate(%s) failed before pool exhaustion", mac)
+			}
+		}
+		if ip := s.allocate("00:11:22:33:44:a4"); ip != nil {
+			t.Fatalf("pool exhausted but allocated %s", ip)
+		}
+	})
+
+	t.Run("free address before wrap is found", func(t *testing.T) {
+		s := newSrv()
+		// nextIP = .101, .100 is the only free address (the pool's first).
+		s.SetReservations(map[string]string{
+			"00:11:22:33:44:01": "10.0.0.101",
+			"00:11:22:33:44:02": "10.0.0.102",
+		})
+		ip := s.allocate("00:11:22:33:44:99")
+		if ip == nil {
+			t.Fatal("pool has a free address but allocation failed")
+		}
+		if ip.String() != "10.0.0.100" {
+			t.Fatalf("expected wrapped allocation .100, got %s", ip)
+		}
+	})
+
+	t.Run("single address pool", func(t *testing.T) {
+		s := &Server{
+			iface:      "eth0",
+			serverIP:   net.ParseIP("10.0.0.1").To4(),
+			mask:       net.CIDRMask(24, 32),
+			rangeStart: net.ParseIP("10.0.0.100").To4(),
+			rangeEnd:   net.ParseIP("10.0.0.100").To4(),
+			dns:        []net.IP{net.ParseIP("8.8.8.8").To4()},
+			lease:      1 * time.Hour,
+			router:     net.ParseIP("10.0.0.1").To4(),
+			leases:     make(map[string]lease),
+			nextIP:     dupIP(net.ParseIP("10.0.0.100").To4()),
+		}
+		if ip := s.allocate("00:11:22:33:44:b1"); ip == nil || ip.String() != "10.0.0.100" {
+			t.Fatalf("single address allocation = %v, want .100", ip)
+		}
+		if ip := s.allocate("00:11:22:33:44:b2"); ip != nil {
+			t.Fatalf("exhausted single-address pool allocated %s", ip)
+		}
+	})
+}
+
 func TestSetPXEOptions(t *testing.T) {
 	s := &Server{
 		iface:    "eth0",

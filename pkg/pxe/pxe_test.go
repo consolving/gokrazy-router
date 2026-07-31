@@ -91,12 +91,12 @@ func TestResolvePathJail(t *testing.T) {
 		{"01-82-78-97-41-e1-db", false}, // macImages escapes root
 	}
 	for _, c := range cases {
-		got, err := s.resolvePath(root, c.req)
+		_, _, err := s.resolvePath(root, c.req)
 		if c.ok && err != nil {
 			t.Errorf("resolvePath(%q) error = %v, want success", c.req, err)
 		}
 		if !c.ok && err == nil {
-			t.Errorf("resolvePath(%q) = %q, want rejection", c.req, got)
+			t.Errorf("resolvePath(%q) succeeded, want rejection", c.req)
 		}
 	}
 }
@@ -116,10 +116,10 @@ func TestResolvePathRejectsSymlinkEscape(t *testing.T) {
 	s := New(cfgWithDefaults())
 	s.cfg.TFTPRoot = root
 
-	if _, err := s.resolvePath(root, "leak.bin"); err == nil {
+	if _, _, err := s.resolvePath(root, "leak.bin"); err == nil {
 		t.Error("resolvePath(leak.bin) = nil error, want symlink escape rejection")
 	}
-	if _, err := s.resolvePath(root, "ok.bin"); err != nil {
+	if _, _, err := s.resolvePath(root, "ok.bin"); err != nil {
 		t.Errorf("resolvePath(ok.bin) error = %v, want success", err)
 	}
 }
@@ -201,11 +201,12 @@ func TestTFTPTransfer(t *testing.T) {
 		}
 		payload := buf[4:n]
 		got = append(got, payload...)
-		if len(payload) < tftpBlockSize {
-			break
-		}
+		last := len(payload) < tftpBlockSize
 		if _, err := client.WriteToUDP(buildACK(block), transferAddr); err != nil {
 			t.Fatal(err)
+		}
+		if last {
+			break
 		}
 		block++
 	}
@@ -345,6 +346,122 @@ func TestSetMacImagesConcurrentWithResolve(t *testing.T) {
 		close(stop)
 	}()
 	wg.Wait()
+}
+
+// TestOpenTFTPFileRejectsSymlinkSwap verifies the TOCTOU defence: a symlink
+// swapped in after path validation is rejected at open time, not followed.
+func TestOpenTFTPFileRejectsSymlinkSwap(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "boot.img"), []byte("real"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.bin")
+	if err := os.WriteFile(outside, []byte("secret"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Validate while the path is a real file.
+	s := New(cfgWithDefaults())
+	s.cfg.TFTPRoot = root
+	rootReal, rel, err := s.resolvePath(root, "sub/boot.img")
+	if err != nil {
+		t.Fatalf("resolvePath: %v", err)
+	}
+
+	// Swap the file for a symlink to an outside file between validation and open.
+	realPath := filepath.Join(root, "sub", "boot.img")
+	if err := os.Remove(realPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, realPath); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := openTFTPFile(rootReal, rel)
+	if err == nil {
+		f.Close()
+		t.Fatal("openTFTPFile followed a swapped symlink; want rejection")
+	}
+}
+
+// TestTFTPFinalBlockRetransmit verifies the final (short) DATA block is
+// retransmitted when its ACK is lost, instead of silently ending the transfer.
+func TestTFTPFinalBlockRetransmit(t *testing.T) {
+	root := t.TempDir()
+	content := make([]byte, 600) // block 1 full (512), block 2 short (88)
+	for i := range content {
+		content[i] = byte(i*13 + 1)
+	}
+	if err := os.WriteFile(filepath.Join(root, "boot.img"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, client, srvAddr := startTestServer(t, root, nil)
+
+	if _, err := client.WriteToUDP(buildRRQ("boot.img"), srvAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	var transferAddr *net.UDPAddr
+	block := uint16(1)
+	var got []byte
+	for {
+		buf := make([]byte, 1500)
+		if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, from, err := client.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("read DATA: %v", err)
+		}
+		if transferAddr == nil {
+			transferAddr = from
+		}
+		if n < 4 || binary.BigEndian.Uint16(buf[:2]) != tftpDATA {
+			t.Fatalf("expected DATA op=3, got op=%d len=%d", binary.BigEndian.Uint16(buf[:2]), n)
+		}
+		gotBlock := binary.BigEndian.Uint16(buf[2:4])
+		if gotBlock != block {
+			t.Fatalf("got block %d, want %d", gotBlock, block)
+		}
+		payload := buf[4:n]
+		got = append(got, payload...)
+
+		if len(payload) < tftpBlockSize {
+			// Final block received. Simulate a lost ACK: wait for the server
+			// to retransmit it before ACKing.
+			buf2 := make([]byte, 1500)
+			if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			n2, from2, err := client.ReadFromUDP(buf2)
+			if err != nil {
+				t.Fatalf("expected final block retransmit, got read error: %v", err)
+			}
+			if !sameAddr(transferAddr, from2) {
+				t.Fatalf("retransmit from %s, expected %s", from2, transferAddr)
+			}
+			if n2 < 4 || binary.BigEndian.Uint16(buf2[:2]) != tftpDATA || binary.BigEndian.Uint16(buf2[2:4]) != block {
+				t.Fatalf("expected DATA block %d retransmit, got op=%d blk=%d", block, binary.BigEndian.Uint16(buf2[:2]), binary.BigEndian.Uint16(buf2[2:4]))
+			}
+			if _, err := client.WriteToUDP(buildACK(block), transferAddr); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+
+		if _, err := client.WriteToUDP(buildACK(block), transferAddr); err != nil {
+			t.Fatal(err)
+		}
+		block++
+	}
+
+	if !bytes.Equal(got, content) {
+		t.Fatalf("received %d bytes, want %d", len(got), len(content))
+	}
 }
 
 func cfgWithDefaults() config.PXEConfig {
