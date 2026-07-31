@@ -197,7 +197,7 @@ A statically linked `smbd` (and `smbpasswd`) must be bundled via ExtraFilePaths,
 
 ### PXE/TFTP server
 
-Serve boot images to PXE clients. The TFTP server listens on UDP/69. Its root directory defaults to `<mountTarget>/tftpboot`.
+Serve boot images to PXE clients. The TFTP server listens on UDP/69. Its root directory defaults to `<mountTarget>/tftpboot`. The TFTP root is a strict jail: requests for absolute paths, `..` traversal or symlinks that resolve outside the root are rejected with a TFTP error, so a client cannot read arbitrary files from the router. Each transfer runs on its own ephemeral UDP port (standard TFTP transfer ID), which keeps concurrent clients isolated.
 
 For a working iPXE chain, place the iPXE UNDI binary (e.g. `undionly.kpxe`) and a real iPXE text script named `boot.ipxe` into the TFTP root. The DHCP server sends `undionly.kpxe` to the initial PXE ROM and `boot.ipxe` once iPXE identifies itself via DHCP option 77 (User Class). If both names point to the same file, iPXE will reload itself in a loop.
 
@@ -228,6 +228,7 @@ Supported fields:
 | `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE |
+| `bindInterface` | Optional `SO_BINDTODEVICE` interface (e.g. `br-vlan31`). Leave empty to serve every scope that advertises option 66/67 — replies are routed out the correct bridge automatically |
 
 DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. Boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > bootFile/defaultImage`. If `pxeBootServer`/`pxeBootFile` are set on a `dhcp` block, those values override the global `services.pxe` defaults for that scope.
 
@@ -296,7 +297,7 @@ Supported keys:
 | Key | Purpose |
 |-----|---------|
 | `[reservations]` | `"mac" = "ip"` fixed leases, merged into every DHCP scope (VLANs, LAN, WiFi) |
-| `[macImages]` | `"mac" = "file"` per-MAC TFTP image (highest precedence) |
+| `[macImages]` | `"mac" = "file"` per-MAC TFTP image (DHCP boot-file precedence: iPXE > per-MAC > UEFI/legacy) |
 | `defaultImage` | TFTP fallback for per-MAC requests that have no `macImages` entry |
 | `pxeBootFile` | DHCP option 67 boot file (applied to all subnets) |
 | `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
@@ -305,7 +306,9 @@ Supported keys:
 | `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes) |
 | `[[smbUsers]]` | Extra SMB users: `name`, `password` |
 
-The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
+The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. This is deliberate: once a client runs iPXE, its `ipxeScript` must win over the MAC mapping or the client would never leave the initial boot loader. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
+
+The extras file replaces (does not merge with) the base `services.pxe` overrides while it is present: `macImages`, `defaultImage`, `pxeBootFile`, `legacyBootFile`, `uefiBootFile` and `ipxeScript` from the JSON config are ignored once an extras file is in place. Values removed from the TOML file are removed at runtime as well — set `defaultImage = ""` to clear it. When the extras file does not exist yet, it is auto-created and seeded from `router.json`, so nothing is lost until the file is edited.
 
 Example covering all interfaces (VLAN 1, 20, 31 and WiFi), a per-MAC PXE image and an extra SMB user:
 
@@ -450,6 +453,5 @@ The columns show:
 | `github.com/google/nftables` | NAT masquerade + isolation rules + traffic counters |
 | `github.com/insomniacslk/dhcp` | DHCPv4 server |
 | `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping and runtime extras config parsing |
-| `github.com/pin/tftp/v3` | TFTP server for PXE boot |
 
 External: `hostapd` and optionally `smbd`/`smbpasswd` (statically compiled, bundled via gokrazy ExtraFilePaths)

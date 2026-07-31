@@ -43,8 +43,8 @@ func TestParseLeaseDuration(t *testing.T) {
 		{"12h", 12 * time.Hour},
 		{"1h30m", 90 * time.Minute},
 		{"30m", 30 * time.Minute},
-		{"", 12 * time.Hour},       // invalid → default
-		{"bogus", 12 * time.Hour},  // invalid → default
+		{"", 12 * time.Hour},      // invalid → default
+		{"bogus", 12 * time.Hour}, // invalid → default
 	}
 	for _, tt := range tests {
 		d := DHCPConfig{LeaseDuration: tt.input}
@@ -223,8 +223,8 @@ func TestApplyExtras(t *testing.T) {
 	if cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"] != "netboot-arm.bin" {
 		t.Errorf("PXE mac image = %v", cfg.Services.PXE.MacImages)
 	}
-	if cfg.Services.PXE.MacImages["00:00:00:00:00:00"] != "fallback.bin" {
-		t.Error("existing PXE mac image overwritten")
+	if _, ok := cfg.Services.PXE.MacImages["00:00:00:00:00:00"]; ok {
+		t.Error("base mac image should be replaced, not merged, when extras are present")
 	}
 	if cfg.Services.PXE.DefaultImage != "netboot.xyz.efi" {
 		t.Errorf("DefaultImage = %q, want netboot.xyz.efi", cfg.Services.PXE.DefaultImage)
@@ -234,6 +234,60 @@ func TestApplyExtras(t *testing.T) {
 	}
 	if cfg.WiFi.DHCP.PXEBootFile != "netboot.xyz.efi" {
 		t.Errorf("WiFi PXEBootFile = %q, want netboot.xyz.efi", cfg.WiFi.DHCP.PXEBootFile)
+	}
+}
+
+func TestApplyExtrasReplacesRemovedValues(t *testing.T) {
+	cfg := Default()
+	cfg.VLANs = []VLANConfig{{ID: 1, Name: "test"}}
+	cfg.Services.PXE.MacImages = map[string]string{
+		"aa:bb:cc:dd:ee:01": "one.bin",
+		"aa:bb:cc:dd:ee:02": "two.bin",
+	}
+	cfg.Services.PXE.DefaultImage = "base.efi"
+	cfg.Services.PXE.LegacyBootFile = "base-legacy"
+	cfg.VLANs[0].DHCP.PXEBootFile = "base-boot"
+
+	// Reload 1: extras replaces and adds.
+	cfg.ApplyExtras(&ExtrasConfig{
+		MacImages: map[string]string{
+			"aa:bb:cc:dd:ee:01": "one-v2.bin",
+			"aa:bb:cc:dd:ee:03": "three.bin",
+		},
+		DefaultImage: "new.efi",
+		PXEBootFile:  "new-boot",
+	})
+	if got := cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:01"]; got != "one-v2.bin" {
+		t.Errorf("changed mac image = %q, want one-v2.bin", got)
+	}
+	if _, ok := cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:02"]; ok {
+		t.Error("removed mac image still present")
+	}
+	if got := cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:03"]; got != "three.bin" {
+		t.Errorf("added mac image = %q, want three.bin", got)
+	}
+	if got := cfg.Services.PXE.DefaultImage; got != "new.efi" {
+		t.Errorf("DefaultImage = %q, want new.efi", got)
+	}
+	if got := cfg.VLANs[0].DHCP.PXEBootFile; got != "new-boot" {
+		t.Errorf("VLAN PXEBootFile = %q, want new-boot", got)
+	}
+
+	// Reload 2: clearing values in the extras file must clear the runtime state.
+	cfg.ApplyExtras(&ExtrasConfig{
+		MacImages: map[string]string{},
+	})
+	if len(cfg.Services.PXE.MacImages) != 0 {
+		t.Errorf("mac images after clear = %v, want empty", cfg.Services.PXE.MacImages)
+	}
+	if got := cfg.Services.PXE.DefaultImage; got != "" {
+		t.Errorf("DefaultImage after clear = %q, want empty", got)
+	}
+	if got := cfg.Services.PXE.LegacyBootFile; got != "" {
+		t.Errorf("LegacyBootFile after clear = %q, want empty", got)
+	}
+	if got := cfg.VLANs[0].DHCP.PXEBootFile; got != "" {
+		t.Errorf("VLAN PXEBootFile after clear = %q, want empty", got)
 	}
 }
 
@@ -299,11 +353,11 @@ func TestExtrasSaveLoad(t *testing.T) {
 	path := filepath.Join(dir, "extras.toml")
 
 	orig := &ExtrasConfig{
-		Reservations:  map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
-		MacImages:     map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
-		DefaultImage:  "netboot.xyz.efi",
-		PXEBootFile:   "netboot.xyz.efi",
-		SMBUsers:      []SMBUser{{Name: "backup", Password: "secret"}},
+		Reservations: map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
+		MacImages:    map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
+		DefaultImage: "netboot.xyz.efi",
+		PXEBootFile:  "netboot.xyz.efi",
+		SMBUsers:     []SMBUser{{Name: "backup", Password: "secret"}},
 	}
 	if err := orig.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)

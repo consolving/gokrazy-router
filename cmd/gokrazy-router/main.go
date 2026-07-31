@@ -374,28 +374,14 @@ func main() {
 	}
 
 	// 9. Start optional PXE/TFTP server.
-	// Default to 0.0.0.0:69, but bind the socket to the PXE VLAN bridge so
-	// TFTP replies leave through the correct interface (matches DHCP server).
-	if cfg.Services.PXE.Enabled && vlanMode && len(cfg.VLANs) > 0 && cfg.Services.PXE.BindInterface == "" {
-		cfg.Services.PXE.BindInterface = vlan.BridgeName(cfg.VLANs[len(cfg.VLANs)-1].ID)
-	}
+	// The listener is left unbound to the local interfaces by default so it can
+	// serve every DHCP scope that advertises option 66/67 (all VLAN bridges and
+	// the Wi-Fi subnet). Kernel routing sends replies out the correct bridge,
+	// since each scope is its own subnet. Set services.pxe.bindInterface to pin
+	// the listener to a single interface if a deployment requires it.
 	var pxeSrv *pxe.Server
 	if cfg.Services.PXE.Enabled {
 		pxeSrv = pxe.New(cfg.Services.PXE)
-		if cfg.Services.ExtrasFile != "" {
-			if extras, err := config.LoadExtras(cfg.Services.ExtrasFile); err == nil {
-				pxeSrv.SetMacImages(extras.MacImages)
-				if cfg.Services.PXE.MacImages == nil {
-					cfg.Services.PXE.MacImages = make(map[string]string)
-				}
-				for mac, img := range extras.MacImages {
-					cfg.Services.PXE.MacImages[mac] = img
-				}
-				if extras.DefaultImage != "" {
-					pxeSrv.SetDefaultImage(extras.DefaultImage)
-				}
-			}
-		}
 		go func() {
 			if err := pxeSrv.Start(); err != nil {
 				log.Printf("pxe: %v", err)
@@ -434,9 +420,7 @@ func main() {
 
 		if pxeSrv != nil {
 			pxeSrv.SetMacImages(extras.MacImages)
-			if extras.DefaultImage != "" {
-				pxeSrv.SetDefaultImage(extras.DefaultImage)
-			}
+			pxeSrv.SetDefaultImage(extras.DefaultImage)
 		}
 
 		if smbServer != nil {
@@ -557,9 +541,9 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 	srv.SetLegacyBootFile(legacy)
 	srv.SetUEFIBootFile(uefi)
 	srv.SetIPXEBootFile(ipxe)
-	if len(macImages) > 0 {
-		srv.SetMacPXEBootFiles(macImages)
-	}
+	// Always replace: an empty map must clear per-MAC overrides removed from
+	// the extras file at runtime.
+	srv.SetMacPXEBootFiles(macImages)
 }
 
 func ifaceIPFromCIDR(cidr string) string {

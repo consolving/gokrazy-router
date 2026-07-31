@@ -308,31 +308,21 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 			}
 		}
 	}
-	for mac, img := range extras.MacImages {
-		if c.Services.PXE.MacImages == nil {
-			c.Services.PXE.MacImages = make(map[string]string)
-		}
-		c.Services.PXE.MacImages[normalizeMAC(mac)] = img
+	// PXE overrides are replaced, not merged: the extras file is the runtime
+	// source of truth for these fields, so entries removed from the file must
+	// disappear from the effective configuration as well. The automatically
+	// created extras file (see ExtrasFromConfig) is seeded from router.json,
+	// so nothing is lost unless the file is edited.
+	c.Services.PXE.MacImages = cloneStringMap(extras.MacImages)
+	c.Services.PXE.DefaultImage = extras.DefaultImage
+	c.Services.PXE.LegacyBootFile = extras.LegacyBootFile
+	c.Services.PXE.UEFIBootFile = extras.UEFIBootFile
+	c.Services.PXE.IPXEScript = extras.IPXEScript
+	for i := range c.VLANs {
+		c.VLANs[i].DHCP.PXEBootFile = extras.PXEBootFile
 	}
-	if extras.DefaultImage != "" {
-		c.Services.PXE.DefaultImage = extras.DefaultImage
-	}
-	if extras.PXEBootFile != "" {
-		for i := range c.VLANs {
-			c.VLANs[i].DHCP.PXEBootFile = extras.PXEBootFile
-		}
-		c.WiFi.DHCP.PXEBootFile = extras.PXEBootFile
-		c.LAN.DHCP.PXEBootFile = extras.PXEBootFile
-	}
-	if extras.LegacyBootFile != "" {
-		c.Services.PXE.LegacyBootFile = extras.LegacyBootFile
-	}
-	if extras.UEFIBootFile != "" {
-		c.Services.PXE.UEFIBootFile = extras.UEFIBootFile
-	}
-	if extras.IPXEScript != "" {
-		c.Services.PXE.IPXEScript = extras.IPXEScript
-	}
+	c.WiFi.DHCP.PXEBootFile = extras.PXEBootFile
+	c.LAN.DHCP.PXEBootFile = extras.PXEBootFile
 	for id, addr := range extras.VLANAddresses {
 		for i := range c.VLANs {
 			if c.VLANs[i].ID == id {
@@ -378,6 +368,17 @@ func ExtrasFromConfig(c *Config) *ExtrasConfig {
 
 func normalizeMAC(mac string) string {
 	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mac, "-", ":")))
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[normalizeMAC(k)] = v
+	}
+	return out
 }
 
 func Default() *Config {

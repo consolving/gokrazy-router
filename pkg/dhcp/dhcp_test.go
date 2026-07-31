@@ -303,6 +303,72 @@ func TestPXEMACOverridePrecedence(t *testing.T) {
 	}
 }
 
+func TestPXEBootfilePrecedenceTable(t *testing.T) {
+	s := &Server{
+		iface:    "eth0",
+		serverIP: net.ParseIP("10.0.0.1").To4(),
+		mask:     net.CIDRMask(24, 32),
+	}
+	s.SetPXEOptions("10.0.0.2", "undionly.kpxe")
+	s.SetLegacyBootFile("undionly.kpxe")
+	s.SetUEFIBootFile("netboot.xyz.efi")
+	s.SetIPXEBootFile("boot.ipxe")
+	s.SetMacPXEBootFiles(map[string]string{
+		"aa:bb:cc:dd:ee:ff": "my-custom.ipxe",
+	})
+
+	mac := "aa:bb:cc:dd:ee:ff"
+	bootfile := func(req *dhcpv4.DHCPv4) string {
+		mod := s.replyOptions(mac, req)
+		resp, err := dhcpv4.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mod(resp)
+		return string(resp.Options.Get(dhcpv4.OptionBootfileName))
+	}
+
+	legacyReq, err := dhcpv4.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipxeReq, err := dhcpv4.New(dhcpv4.WithUserClass("iPXE", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uefiReq, err := dhcpv4.New(dhcpv4.WithGeneric(dhcpv4.OptionClientSystemArchitectureType, []byte{0, 7}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Documented precedence: iPXE > per-MAC > UEFI > legacy.
+	cases := []struct {
+		name     string
+		req      *dhcpv4.DHCPv4
+		withMAC  bool
+		wantBoot string
+	}{
+		{"ipxe with mac override", ipxeReq, true, "boot.ipxe"},
+		{"ipxe without mac override", ipxeReq, false, "boot.ipxe"},
+		{"uefi with mac override", uefiReq, true, "my-custom.ipxe"},
+		{"uefi without mac override", uefiReq, false, "netboot.xyz.efi"},
+		{"legacy with mac override", legacyReq, true, "my-custom.ipxe"},
+		{"legacy without mac override", legacyReq, false, "undionly.kpxe"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.withMAC {
+				s.SetMacPXEBootFiles(map[string]string{mac: "my-custom.ipxe"})
+			} else {
+				s.SetMacPXEBootFiles(nil)
+			}
+			if got := bootfile(c.req); got != c.wantBoot {
+				t.Errorf("bootfile = %q, want %q", got, c.wantBoot)
+			}
+		})
+	}
+}
+
 func TestNormalizeMAC(t *testing.T) {
 	cases := []struct {
 		in   string
