@@ -410,43 +410,26 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		s.mu.Lock()
 		bootServer := s.pxeBootServer
 		bootFile := s.pxeBootFile
-		if f, ok := s.macPXEBootFiles[normalizeMAC(mac)]; ok {
-			bootFile = f
-		}
+		macFile, hasMacFile := s.macPXEBootFiles[normalizeMAC(mac)]
 		ipxe := s.ipxeBootFile
 		uefi := s.uefiBootFile
 		legacy := s.legacyBootFile
 		s.mu.Unlock()
 
 		classified := ""
-		if req != nil && ipxe != "" {
-			uc := req.Options.Get(dhcpv4.OptionUserClassInformation)
-			if len(uc) > 0 && bytes.Contains(bytes.ToLower(uc), []byte("ipxe")) {
-				bootFile = ipxe
-				classified = "ipxe"
-			}
-		}
-
-		if classified == "" && req != nil {
-			archBytes := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
-			if len(archBytes) >= 2 {
-				arch := binary.BigEndian.Uint16(archBytes)
-				switch arch {
-				case 7, 9:
-					if uefi != "" {
-						bootFile = uefi
-						classified = "uefi"
-					}
-				default:
-					if legacy != "" {
-						bootFile = legacy
-						classified = "legacy"
-					}
-				}
-			} else if legacy != "" {
-				bootFile = legacy
-				classified = "legacy"
-			}
+		switch {
+		case hasMacFile:
+			bootFile = macFile
+			classified = "mac"
+		case ipxe != "" && req != nil && isIPXEClient(req):
+			bootFile = ipxe
+			classified = "ipxe"
+		case uefi != "" && req != nil && isUEFIClient(req):
+			bootFile = uefi
+			classified = "uefi"
+		case legacy != "":
+			bootFile = legacy
+			classified = "legacy"
 		}
 
 		if bootServer != nil {
@@ -458,6 +441,23 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
 		}
 	}
+}
+
+func isIPXEClient(req *dhcpv4.DHCPv4) bool {
+	uc := req.Options.Get(dhcpv4.OptionUserClassInformation)
+	return len(uc) > 0 && bytes.Contains(bytes.ToLower(uc), []byte("ipxe"))
+}
+
+func isUEFIClient(req *dhcpv4.DHCPv4) bool {
+	archBytes := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
+	if len(archBytes) < 2 {
+		return false
+	}
+	switch binary.BigEndian.Uint16(archBytes) {
+	case 7, 9:
+		return true
+	}
+	return false
 }
 
 func dupIP(ip net.IP) net.IP {

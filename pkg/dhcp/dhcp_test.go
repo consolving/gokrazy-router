@@ -253,6 +253,48 @@ func TestPXEBootfileSelection(t *testing.T) {
 	}
 }
 
+func TestPXEMACOverridePrecedence(t *testing.T) {
+	s := &Server{
+		iface:    "eth0",
+		serverIP: net.ParseIP("10.0.0.1").To4(),
+		mask:     net.CIDRMask(24, 32),
+	}
+	s.SetPXEOptions("10.0.0.2", "undionly.kpxe")
+	s.SetLegacyBootFile("undionly.kpxe")
+	s.SetUEFIBootFile("netboot.xyz.efi")
+	s.SetIPXEBootFile("boot.ipxe")
+	s.SetMacPXEBootFiles(map[string]string{
+		"aa:bb:cc:dd:ee:ff": "my-custom.ipxe",
+	})
+
+	mac := "aa:bb:cc:dd:ee:ff"
+	bootfile := func(req *dhcpv4.DHCPv4) string {
+		mod := s.replyOptions(mac, req)
+		resp, err := dhcpv4.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mod(resp)
+		return string(resp.Options.Get(dhcpv4.OptionBootfileName))
+	}
+
+	ipxeReq, err := dhcpv4.New(dhcpv4.WithUserClass("iPXE", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(ipxeReq); got != "my-custom.ipxe" {
+		t.Errorf("iPXE client with MAC override bootfile = %q, want my-custom.ipxe", got)
+	}
+
+	uefiReq, err := dhcpv4.New(dhcpv4.WithGeneric(dhcpv4.OptionClientSystemArchitectureType, []byte{0, 7}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bootfile(uefiReq); got != "my-custom.ipxe" {
+		t.Errorf("UEFI client with MAC override bootfile = %q, want my-custom.ipxe", got)
+	}
+}
+
 func TestNormalizeMAC(t *testing.T) {
 	cases := []struct {
 		in   string
