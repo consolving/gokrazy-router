@@ -160,15 +160,12 @@ func (s *Server) reader(conn *net.UDPConn, root string) {
 			log.Printf("pxe: received RRQ from %s (op=%d)", client, binary.BigEndian.Uint16(pkt[:2]))
 			go s.serveFile(conn, root, client, pkt)
 		case tftpACK:
-			log.Printf("pxe: received ACK from %s len=%d", client, len(pkt))
 			if len(pkt) >= 4 {
 				if ch, ok := s.acks.Load(client.IP.String()); ok {
 					select {
 					case ch.(chan []byte) <- pkt:
 					default:
 					}
-				} else {
-					log.Printf("pxe: no ack channel for %s", client.IP)
 				}
 			}
 		default:
@@ -198,17 +195,7 @@ func (s *Server) serveFile(control *net.UDPConn, root string, client *net.UDPAdd
 	}
 	defer s.active.Delete(dupKey)
 
-	mac := filenameToMAC(filename)
-	img := ""
-	if mac != "" {
-		img = s.handler[normalizeMAC(mac)]
-	}
-	if img == "" {
-		img = s.cfg.DefaultImage
-	}
-	if img == "" {
-		img = filename
-	}
+	img := s.resolveImage(filename)
 
 	if !filepath.IsAbs(img) {
 		img = filepath.Join(root, img)
@@ -294,6 +281,19 @@ func cstring(b []byte) (string, []byte) {
 		}
 	}
 	return "", nil
+}
+
+func (s *Server) resolveImage(filename string) string {
+	mac := filenameToMAC(filename)
+	if mac != "" {
+		if img, ok := s.handler[normalizeMAC(mac)]; ok {
+			return img
+		}
+		if s.cfg.DefaultImage != "" {
+			return s.cfg.DefaultImage
+		}
+	}
+	return filename
 }
 
 func filenameToMAC(name string) string {
