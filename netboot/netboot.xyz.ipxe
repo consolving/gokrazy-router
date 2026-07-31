@@ -1,6 +1,15 @@
 #!ipxe
 # Chainload the official netboot.xyz iPXE menu.
-# Place this in the TFTP root (e.g. /mnt/data/tftpboot/netboot.xyz.ipxe)
-# and set services.pxe.ipxeScript to "netboot.xyz.ipxe".
-chain --autofree https://boot.netboot.xyz/ipxe/netboot.xyz.ipxe ||
-chain --autofree http://boot.netboot.xyz/ipxe/netboot.xyz.ipxe
+#
+# Note: boot.netboot.xyz/ipxe/netboot.xyz.ipxe no longer exists (404). The
+# current entry point is boot.netboot.xyz/menu.ipxe, which loads the menu
+# via relative paths and works over plain HTTP.
+#
+# HTTPS requires an iPXE build with HTTPS support. If the build lacks it,
+# the HTTPS attempt fails with "Operation not supported" (ipxe.org/3c092003),
+# so HTTP is tried first.
+#
+# Place this file in the TFTP root (e.g. /mnt/data/tftpboot/netboot.xyz.ipxe).
+chain --autofree http://boot.netboot.xyz/menu.ipxe ||
+chain --autofree https://boot.netboot.xyz/menu.ipxe ||
+shell
