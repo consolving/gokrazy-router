@@ -11,24 +11,11 @@
 #   ip             - Static DHCP reservation (optional)
 #   netboot_image  - Subdirectory in the TFTP root for this client (optional)
 
-default_vlan = 30
-
-[[clients]]
-mac = "aa:bb:cc:dd:ee:ff"
-vlan = 1
-name = "Philipp's laptop"
-ip = "10.0.1.10"
-netboot_image = "ubuntu-22.04"
-
-[[clients]]
-mac = "11:22:33:44:55:66"
-vlan = 20
-name = "thermostat"
-hostname = "tado-bridge"
-ip = "10.0.20.50"
-
-[[clients]]
-mac = "de:ad:be:ef:00:01"
-vlan = 1
-name = "workstation"
-ip = "10.0.1.20"
+# Replace the example below with real device MACs.
+# Example entry:
+# [[clients]]
+# mac = "aa:bb:cc:dd:ee:01"
+# vlan = 1
+# name = "Philipp's laptop"
+# hostname = "philipp-mbp"
+# ip = "10.0.1.10"

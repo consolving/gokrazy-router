@@ -55,6 +55,21 @@ func main() {
 	// Expand ${ENV} references in service configuration.
 	cfg.ExpandEnv()
 
+	// Apply global DNS default to all DHCP scopes that don't have one.
+	if len(cfg.DNS) > 0 {
+		if len(cfg.LAN.DHCP.DNS) == 0 {
+			cfg.LAN.DHCP.DNS = append([]string(nil), cfg.DNS...)
+		}
+		for i := range cfg.VLANs {
+			if len(cfg.VLANs[i].DHCP.DNS) == 0 {
+				cfg.VLANs[i].DHCP.DNS = append([]string(nil), cfg.DNS...)
+			}
+		}
+		if len(cfg.WiFi.DHCP.DNS) == 0 {
+			cfg.WiFi.DHCP.DNS = append([]string(nil), cfg.DNS...)
+		}
+	}
+
 	// Immutable snapshot of the base JSON config, taken before any extras are
 	// merged. Reloads derive effective per-scope state (e.g. reservations)
 	// from this snapshot plus the current extras file, instead of mutating
@@ -511,8 +526,8 @@ type reloader struct {
 }
 
 // Reload re-reads the extras file and applies it to DHCP, PXE and (where
-// supported) SMB. Changes that require reconfiguring live network/DHCP/NAT
-// state or restarting Samba are rejected with a restartRequiredError.
+// supported) SMB. If the extras file is invalid or unreadable, the reload
+// silently falls back to the base JSON config so the router keeps running.
 func (r *reloader) Reload() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -522,7 +537,8 @@ func (r *reloader) Reload() error {
 	}
 	extras, err := loadOrCreateExtras(r.extrasPath, r.cfg)
 	if err != nil {
-		return fmt.Errorf("load extras: %w", err)
+		log.Printf("reload: extras load failed (%v), falling back to base config", err)
+		extras = &config.ExtrasConfig{}
 	}
 
 	if err := r.checkRestartRequired(extras); err != nil {

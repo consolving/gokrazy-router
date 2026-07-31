@@ -21,6 +21,7 @@ type Config struct {
 	NAT      NATConfig      `json:"nat"`
 	WiFi     WiFiConfig     `json:"wifi,omitempty"`
 	Services ServicesConfig `json:"services,omitempty"`
+	DNS      []string       `json:"dns,omitempty"` // default DNS for all DHCP scopes
 }
 
 type WANConfig struct {
@@ -138,15 +139,16 @@ type PXEConfig struct {
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations   map[string]string `toml:"reservations"`             // MAC -> IP
-	MacImages      map[string]string `toml:"macImages"`                // MAC -> PXE image filename
-	DefaultImage   string            `toml:"defaultImage"`             // PXE default image (overrides router.json)
-	PXEBootFile    string            `toml:"pxeBootFile"`              // DHCP option 67 bootfile (applied to all subnets)
-	LegacyBootFile string            `toml:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
-	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
-	IPXEScript     string            `toml:"ipxeScript,omitempty"`     // option 67 once iPXE identifies itself
-	SMBUsers       []SMBUser         `toml:"smbUsers"`                 // additional SMB users
-	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`  // VLAN ID -> CIDR address override
+	Reservations   map[string]string `toml:"reservations"`              // MAC -> IP
+	MacImages      map[string]string `toml:"macImages"`                 // MAC -> PXE image filename
+	DefaultImage   string            `toml:"defaultImage"`              // PXE default image (overrides router.json)
+	PXEBootFile    string            `toml:"pxeBootFile"`               // DHCP option 67 bootfile (applied to all subnets)
+	LegacyBootFile string            `toml:"legacyBootFile,omitempty"`  // option 67 for legacy BIOS PXE clients
+	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`    // option 67 for UEFI PXE clients
+	IPXEScript     string            `toml:"ipxeScript,omitempty"`      // option 67 once iPXE identifies itself
+	SMBUsers       []SMBUser         `toml:"smbUsers"`                  // additional SMB users
+	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`   // VLAN ID -> CIDR address override
+	DNS            []string          `toml:"dns,omitempty"`             // default DNS for all DHCP scopes
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -346,6 +348,16 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 			}
 		}
 	}
+	// DNS overrides are applied to all scopes: extras is the runtime source
+	// of truth, so removing an entry from the file will revert the scope back
+	// to whatever the base JSON had (or the global config.DNS default).
+	if len(extras.DNS) > 0 {
+		for i := range c.VLANs {
+			c.VLANs[i].DHCP.DNS = extras.DNS
+		}
+		c.WiFi.DHCP.DNS = extras.DNS
+		c.LAN.DHCP.DNS = extras.DNS
+	}
 }
 
 // ExtrasFromConfig populates an ExtrasConfig from the current Config.
@@ -399,6 +411,7 @@ func cloneStringMap(m map[string]string) map[string]string {
 func Default() *Config {
 	return &Config{
 		WAN: WANConfig{Interface: "wan", Mode: "dhcp"},
+		DNS: []string{"1.1.1.1", "8.8.8.8"},
 		LAN: LANConfig{
 			Bridge:     "br-lan",
 			Interfaces: []string{"lan1", "lan2", "lan3", "lan4"},
@@ -408,7 +421,6 @@ func Default() *Config {
 				RangeStart:    "10.0.0.100",
 				RangeEnd:      "10.0.0.250",
 				LeaseDuration: "12h",
-				DNS:           []string{"1.1.1.1", "8.8.8.8"},
 			},
 		},
 		NAT: NATConfig{Enabled: true, OutInterface: "wan"},

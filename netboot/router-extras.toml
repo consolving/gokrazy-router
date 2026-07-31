@@ -3,15 +3,19 @@
 # configure services.extrasFile to point to it.
 #
 # This file is re-read on every gokrazy router restart, so changes to
-# reservations, PXE images, and boot files take effect without redeploying.
+# reservations, PXE images, and DNS take effect without redeploying.
 # POST /api/reload (Authorization: Bearer <token>, see services.adminAPI)
-# applies reservations + PXE settings live without a restart. Changes to
-# [vlanAddresses] and [[smbUsers]] require a router restart and are
+# applies reservations + PXE settings + DNS live without a restart.
+# Changes to [vlanAddresses] and [[smbUsers]] require a router restart and are
 # rejected by /api/reload with HTTP 409.
 
 # Static DHCP reservations (MAC -> IP). Only applied to the matching subnet.
 [reservations]
 "5c:ff:35:0d:b3:49" = "10.0.31.150"
+
+# DNS servers for all DHCP scopes. Overrides the base config dns field.
+# Up to 3 servers: primary, secondary, tertiary.
+dns = ["1.1.1.1", "8.8.8.8", "1.0.0.1"]
 
 # Per-MAC PXE image file name. The requested TFTP filename is matched
 # against the client MAC address. This is the ONLY way to give a client a

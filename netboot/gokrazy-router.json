@@ -1,52 +1,26 @@
 {
   "wan": {"interface": "wan", "mode": "dhcp"},
   "lan": {"bridge": "br-lan", "interfaces": [], "address": "10.0.0.1/24", "dhcp": {"enabled": false}},
+  "dns": "${DNS_SERVERS:-1.1.1.1,8.8.8.8,1.0.0.1}",
   "vlans": [
-    {
-      "id": 1, "name": "trusted", "ports": ["lan1"],
-      "address": "10.0.1.1/24",
-      "dhcp": {"enabled": true, "rangeStart": "10.0.1.100", "rangeEnd": "10.0.1.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
-      "nat": true
-    },
-    {
-      "id": 20, "name": "iot", "ports": ["lan2"],
-      "address": "10.0.20.1/24",
-      "dhcp": {"enabled": true, "rangeStart": "10.0.20.100", "rangeEnd": "10.0.20.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
-      "nat": true, "isolated": true
-    },
-    {
-      "id": 30, "name": "open", "ports": ["lan3"],
-      "address": "10.0.30.1/24",
-      "dhcp": {"enabled": true, "rangeStart": "10.0.30.100", "rangeEnd": "10.0.30.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
-      "nat": true
-    }
+    {"id": 1, "name": "trusted", "ports": ["lan1"], "address": "10.0.1.1/24", "dhcp": {"enabled": true, "rangeStart": "10.0.1.100", "rangeEnd": "10.0.1.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]}, "nat": true},
+    {"id": 20, "name": "iot", "ports": ["lan2"], "address": "10.0.20.1/24", "dhcp": {"enabled": true, "rangeStart": "10.0.20.100", "rangeEnd": "10.0.20.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]}, "nat": true, "isolated": true},
+    {"id": 30, "name": "open", "ports": ["lan3"], "address": "10.0.30.1/24", "dhcp": {"enabled": true, "rangeStart": "10.0.30.100", "rangeEnd": "10.0.30.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]}, "nat": true},
+    {"id": 31, "name": "shared", "ports": ["lan4"], "address": "10.0.31.129/25", "dhcp": {"enabled": true, "rangeStart": "10.0.31.150", "rangeEnd": "10.0.31.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]}, "nat": true}
   ],
   "nat": {"enabled": true, "outInterface": "wan"},
   "wifi": {
-    "enabled": true, "interface": "wlan0",
-    "address": "10.0.31.1/25",
+    "enabled": true, "interface": "wlan0", "address": "10.0.31.1/25",
     "dhcp": {"enabled": true, "rangeStart": "10.0.31.100", "rangeEnd": "10.0.31.126", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
     "macMapFile": "/etc/gokrazy-router-macmap.toml",
-    "ssid": "gokrazy", "passphrase": "changeme123",
+    "ssid": "${WIFI_SSID:-gokrazy}", "passphrase": "${WIFI_PASSPHRASE}",
     "channel": 6, "hwMode": "g", "countryCode": "DE", "wpa": 2
   },
   "services": {
-    "mount": {
-      "enabled": true,
-      "device": "${DISK_DEVICE}",
-      "fsType": "ext4",
-      "target": "${DISK_TARGET}",
-      "options": "${DISK_OPTS}"
-    },
-    "pxe": {
-      "enabled": true,
-      "listen": "0.0.0.0:69",
-      "tftpRoot": "/mnt/data/tftpboot"
-    },
-    "extrasFile": "/mnt/data/router-extras.toml",
-    "adminAPI": {
-      "listen": "127.0.0.1:8080",
-      "token": "CHANGE_ME"
-    }
+    "mount": {"enabled": true, "device": "/dev/sda1", "fsType": "ext4", "target": "/mnt/sata", "options": ""},
+    "smb": {"enabled": true, "binPath": "/usr/local/bin/portable-smb-server", "usePortableServer": true, "listen": "0.0.0.0:445", "shareName": "sata", "sharePath": "/mnt/sata", "user": "${SMB_USER:-gokrazy}", "password": "${SMB_PASSWORD}"},
+    "adminAPI": {"listen": "127.0.0.1:8080", "token": "CHANGE_ME", "allowUnauthenticatedReload": false},
+    "pxe": {"enabled": true, "listen": "0.0.0.0:69", "tftpRoot": "/mnt/sata/tftpboot", "defaultImage": "", "macImages": {}},
+    "extrasFile": "/mnt/sata/router-extras.toml"
   }
 }

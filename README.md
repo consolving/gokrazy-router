@@ -111,7 +111,7 @@ Example files are provided in the [`netboot/`](netboot/) directory:
     "enabled": true, "interface": "wlan0",
     "address": "10.0.31.1/25",
     "dhcp": {"enabled": true, "rangeStart": "10.0.31.100", "rangeEnd": "10.0.31.126", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
-    "ssid": "gokrazy", "passphrase": "changeme123",
+    "ssid": "gokrazy", "passphrase": "${WIFI_PASSPHRASE}",
     "channel": 6, "hwMode": "g", "countryCode": "DE", "wpa": 2
   }
 }
@@ -135,7 +135,7 @@ When the `vlans` array is empty or omitted, all LAN ports are bridged into a sin
     "enabled": true, "interface": "wlan0",
     "address": "10.0.1.1/24",
     "dhcp": {"enabled": true, "rangeStart": "10.0.1.100", "rangeEnd": "10.0.1.250", "leaseDuration": "12h", "dns": ["1.1.1.1", "8.8.8.8"]},
-    "ssid": "gokrazy", "passphrase": "changeme123",
+    "ssid": "gokrazy", "passphrase": "${WIFI_PASSPHRASE}",
     "channel": 6, "hwMode": "g", "countryCode": "DE", "wpa": 2
   }
 }
