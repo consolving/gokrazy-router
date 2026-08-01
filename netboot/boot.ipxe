@@ -1,0 +1,16 @@
+#!ipxe
+# Example iPXE boot script for gokrazy-router (validated on ThinkPad T410i).
+#
+# This TEXT file is served once iPXE has already been loaded. The initial
+# legacy PXE ROM must receive the iPXE UNDI binary, usually named
+# undionly.kpxe (configured as services.pxe.legacyBootFile or bootFile).
+#
+# Place this file in the TFTP root (e.g. /mnt/data/tftpboot/boot.ipxe) and
+# set services.pxe.ipxeScript to "boot.ipxe".
+#
+# Chain to the local netboot.xyz menu script. On failure, drop to the
+# iPXE shell instead of returning to the PXE ROM.
+
+dhcp
+chain tftp://${next-server}/netboot.xyz.ipxe ||
+shell

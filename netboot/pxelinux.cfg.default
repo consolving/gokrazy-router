@@ -1,0 +1,12 @@
+# Example pxelinux configuration for legacy PXE boot.
+#
+# Place this at <tftpRoot>/pxelinux.cfg/default
+# (e.g. /mnt/data/tftpboot/pxelinux.cfg/default)
+
+DEFAULT linux
+PROMPT 0
+TIMEOUT 30
+
+LABEL linux
+  KERNEL vmlinuz
+  APPEND initrd=initrd.img console=ttyS0,115200 root=/dev/nfs nfsroot=${next-server}:/srv/nfs ip=dhcp

@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	hostapdCtrlDir = "/var/run/hostapd"
+	hostapdCtrlDir = "/tmp/hostapd"
 	ctrlTimeout    = 2 * time.Second
 )
 

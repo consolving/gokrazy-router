@@ -1,8 +1,3 @@
-// Command gokrazy-router-status queries the router's status API and displays
-// port link states and per-client traffic counters.
-//
-// It can also export the list of known MAC addresses as a TOML file for
-// VLAN assignment, and merge new clients into an existing mapping file.
 package main
 
 import (
@@ -13,6 +8,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/consolving/gokrazy-router/pkg/config"
 	"github.com/consolving/gokrazy-router/pkg/macmap"
 )
 
@@ -66,12 +62,46 @@ type Status struct {
 	Clients []ClientInfo  `json:"clients"`
 }
 
+const defaultExtrasFile = "/mnt/data/router-extras.toml"
+
 func main() {
-	host := flag.String("host", "10.0.0.1:8080", "router status API address")
-	jsonOut := flag.Bool("json", false, "output raw JSON")
-	exportTOML := flag.Bool("export-toml", false, "export known MACs as TOML mac-vlan-map")
-	mergeFile := flag.String("merge", "", "merge new MACs into existing TOML file (use with --export-toml)")
-	flag.Parse()
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "status":
+		runStatus(os.Args[2:])
+	case "extras":
+		runExtras(os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n", os.Args[1])
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: router-cli <subcommand> [options]
+
+Subcommands:
+  status      Query router status API
+  extras      Manage runtime extras config (reservations, PXE images)
+
+Run 'router-cli status --help' or 'router-cli extras --help' for details.
+`)
+}
+
+// --- Status subcommand ---
+
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	host := fs.String("host", "10.0.0.1:8080", "router status API address")
+	jsonOut := fs.Bool("json", false, "output raw JSON")
+	exportTOML := fs.Bool("export-toml", false, "export known MACs as TOML mac-vlan-map")
+	mergeFile := fs.String("merge", "", "merge new MACs into existing TOML file (use with --export-toml)")
+	fs.Parse(args)
 
 	resp, err := http.Get(fmt.Sprintf("http://%s/status", *host))
 	if err != nil {
@@ -98,12 +128,10 @@ func main() {
 		return
 	}
 
-	// Ports table (wan, lan1-4, wifi)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "IFACE\tMAC\tSPEED\tRX\tTX\tRX PKTS\tTX PKTS\n")
 	for _, p := range s.Ports {
 		if len(p.Sub) > 0 {
-			// Show sub-ports directly (e.g. lan1-lan4 instead of lan)
 			for _, sub := range p.Sub {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
 					sub.Name, sub.MAC, formatSpeed(sub.Speed, sub.Duplex),
@@ -120,7 +148,6 @@ func main() {
 	w.Flush()
 
 	if len(s.Clients) > 0 {
-		// Separate connected and disconnected clients.
 		var connected, disconnected []ClientInfo
 		for _, c := range s.Clients {
 			if c.Connected {
@@ -185,6 +212,179 @@ func main() {
 	}
 }
 
+// --- Extras subcommand ---
+
+func runExtras(args []string) {
+	if len(args) < 1 {
+		printExtrasUsage()
+		os.Exit(1)
+	}
+
+	// Parse global extras flags (--file) before the subcommand.
+	file := defaultExtrasFile
+	if len(args) > 0 && args[0] == "--file" {
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "error: --file requires a path")
+			os.Exit(1)
+		}
+		file = args[1]
+		args = args[2:]
+	}
+
+	if len(args) < 1 {
+		printExtrasUsage()
+		os.Exit(1)
+	}
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "list":
+		runExtrasList(file)
+	case "set-reservation":
+		runExtrasSetReservation(file, subArgs)
+	case "remove-reservation":
+		runExtrasRemoveReservation(file, subArgs)
+	case "set-mac-image":
+		runExtrasSetMacImage(file, subArgs)
+	case "remove-mac-image":
+		runExtrasRemoveMacImage(file, subArgs)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown extras subcommand: %s\n", sub)
+		printExtrasUsage()
+		os.Exit(1)
+	}
+}
+
+func printExtrasUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: router-cli extras [--file <path>] <command> [args]
+
+Commands:
+  list                          Show current extras config
+  set-reservation <mac> <ip>    Add or update a DHCP reservation
+  remove-reservation <mac>      Remove a DHCP reservation
+  set-mac-image <mac> <image>   Set PXE boot image for a MAC
+  remove-mac-image <mac>        Remove PXE boot image for a MAC
+
+Default file: %s
+`, defaultExtrasFile)
+}
+
+func loadExtras(path string) *config.ExtrasConfig {
+	e, err := config.LoadExtras(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &config.ExtrasConfig{}
+		}
+		fmt.Fprintf(os.Stderr, "error loading %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	return e
+}
+
+func saveExtras(path string, e *config.ExtrasConfig) {
+	if err := e.Save(path); err != nil {
+		fmt.Fprintf(os.Stderr, "error saving %s: %v\n", path, err)
+		os.Exit(1)
+	}
+}
+
+func runExtrasList(file string) {
+	e := loadExtras(file)
+
+	if len(e.Reservations) == 0 && len(e.MacImages) == 0 && len(e.SMBUsers) == 0 {
+		fmt.Println("(empty)")
+		return
+	}
+
+	if len(e.Reservations) > 0 {
+		fmt.Println("[reservations]")
+		for mac, ip := range e.Reservations {
+			fmt.Printf("  %s = %s\n", mac, ip)
+		}
+		fmt.Println()
+	}
+
+	if len(e.MacImages) > 0 {
+		fmt.Println("[macImages]")
+		for mac, img := range e.MacImages {
+			fmt.Printf("  %s = %s\n", mac, img)
+		}
+		fmt.Println()
+	}
+
+	if len(e.SMBUsers) > 0 {
+		fmt.Println("[[smbUsers]]")
+		for _, u := range e.SMBUsers {
+			fmt.Printf("  name = %s\n", u.Name)
+		}
+		fmt.Println()
+	}
+}
+
+func runExtrasSetReservation(file string, args []string) {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: router-cli extras set-reservation <mac> <ip>")
+		os.Exit(1)
+	}
+	mac, ip := args[0], args[1]
+	e := loadExtras(file)
+	if err := e.SetReservation(mac, ip); err == config.ErrNotModified {
+		fmt.Printf("reservation for %s unchanged (%s)\n", mac, ip)
+		return
+	}
+	saveExtras(file, e)
+	fmt.Printf("reservation set: %s -> %s\n", mac, ip)
+}
+
+func runExtrasRemoveReservation(file string, args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: router-cli extras remove-reservation <mac>")
+		os.Exit(1)
+	}
+	mac := args[0]
+	e := loadExtras(file)
+	if err := e.RemoveReservation(mac); err == config.ErrNotModified {
+		fmt.Printf("no reservation found for %s\n", mac)
+		return
+	}
+	saveExtras(file, e)
+	fmt.Printf("reservation removed: %s\n", mac)
+}
+
+func runExtrasSetMacImage(file string, args []string) {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: router-cli extras set-mac-image <mac> <image>")
+		os.Exit(1)
+	}
+	mac, img := args[0], args[1]
+	e := loadExtras(file)
+	if err := e.SetMacImage(mac, img); err == config.ErrNotModified {
+		fmt.Printf("mac image for %s unchanged (%s)\n", mac, img)
+		return
+	}
+	saveExtras(file, e)
+	fmt.Printf("mac image set: %s -> %s\n", mac, img)
+}
+
+func runExtrasRemoveMacImage(file string, args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: router-cli extras remove-mac-image <mac>")
+		os.Exit(1)
+	}
+	mac := args[0]
+	e := loadExtras(file)
+	if err := e.RemoveMacImage(mac); err == config.ErrNotModified {
+		fmt.Printf("no mac image found for %s\n", mac)
+		return
+	}
+	saveExtras(file, e)
+	fmt.Printf("mac image removed: %s\n", mac)
+}
+
+// --- Helpers ---
+
 func humanBytes(b uint64) string {
 	switch {
 	case b >= 1<<30:
@@ -229,7 +429,6 @@ func formatLinkRate(txKbps, rxKbps int) string {
 	if txKbps <= 0 && rxKbps <= 0 {
 		return "-"
 	}
-	// Link rates from hostapd are in Kbps, display in Mbps.
 	tx := float64(txKbps) / 1000
 	rx := float64(rxKbps) / 1000
 	if tx == rx {
@@ -245,10 +444,7 @@ func formatSignal(dBm int) string {
 	return fmt.Sprintf("%d dBm", dBm)
 }
 
-// exportMACMap builds a TOML mac-vlan-map from the status API's client list.
-// If mergeFile is set, it loads the existing file and adds only new MACs.
 func exportMACMap(s Status, mergeFile string) {
-	// Build a MapFile from the current status.
 	current := &macmap.MapFile{}
 	for _, c := range s.Clients {
 		if c.MAC == "" {
@@ -256,9 +452,8 @@ func exportMACMap(s Status, mergeFile string) {
 		}
 		client := macmap.Client{
 			MAC:  c.MAC,
-			VLAN: 0, // unassigned
+			VLAN: 0,
 		}
-		// Use IP as a hint in the name field.
 		if c.IP != "" {
 			via := c.Via
 			if via == "W" {
@@ -272,7 +467,6 @@ func exportMACMap(s Status, mergeFile string) {
 	}
 
 	if mergeFile != "" {
-		// Load existing file, merge new MACs into it.
 		existing, err := macmap.Load(mergeFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error loading %s: %v\n", mergeFile, err)
@@ -281,7 +475,6 @@ func exportMACMap(s Status, mergeFile string) {
 		existing.Merge(current)
 		current = existing
 	} else {
-		// Fresh export -- set a sensible default.
 		current.DefaultVLAN = 1
 		fmt.Fprintln(os.Stderr, "# Exported MAC addresses from router status API.")
 		fmt.Fprintln(os.Stderr, "# Edit VLAN assignments, then deploy to the router.")

@@ -1,0 +1,21 @@
+# MAC-to-VLAN mapping with static IP reservations and netboot images.
+#
+# Place this file at the path referenced by wifi.macMapFile in
+# gokrazy-router.json (e.g. /etc/gokrazy-router-macmap.toml).
+#
+# Fields:
+#   mac            - Client MAC address (required)
+#   vlan           - VLAN ID to assign (required)
+#   name           - Human-readable label (optional)
+#   hostname       - Expected DHCP hostname (optional, informational)
+#   ip             - Static DHCP reservation (optional)
+#   netboot_image  - Subdirectory in the TFTP root for this client (optional)
+
+# Replace the example below with real device MACs.
+# Example entry:
+# [[clients]]
+# mac = "aa:bb:cc:dd:ee:01"
+# vlan = 1
+# name = "Philipp's laptop"
+# hostname = "philipp-mbp"
+# ip = "10.0.1.10"

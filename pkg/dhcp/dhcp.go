@@ -2,10 +2,13 @@
 package dhcp
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,25 +26,38 @@ type LeaseExpiredCallback func(ip net.IP, mac string)
 // Server is a minimal DHCPv4 server that hands out leases from a
 // configured range on a specific interface.
 type Server struct {
-	iface     string
-	serverIP  net.IP
-	mask      net.IPMask
+	iface      string
+	serverIP   net.IP
+	mask       net.IPMask
 	rangeStart net.IP
 	rangeEnd   net.IP
-	dns       []net.IP
-	lease     time.Duration
-	router    net.IP
+	dns        []net.IP
+	lease      time.Duration
+	router     net.IP
 
-	mu             sync.Mutex
-	leases         map[string]lease // MAC -> lease
-	nextIP         net.IP
-	onLease        LeaseCallback
-	onLeaseExpired LeaseExpiredCallback
+	mu              sync.Mutex
+	leases          map[string]lease // MAC -> lease
+	nextIP          net.IP
+	reservations    map[string]net.IP // normalized MAC -> IP
+	pxeBootServer   net.IP
+	pxeBootFile     string
+	macPXEBootFiles map[string]string // normalized MAC -> bootfile (DHCP option 67)
+	ipxeBootFile    string            // bootfile for clients that already run iPXE
+	uefiBootFile    string            // bootfile for UEFI PXE clients
+	legacyBootFile  string            // bootfile for legacy BIOS PXE clients
+	onLease         LeaseCallback
+	onLeaseExpired  LeaseExpiredCallback
 }
 
 type lease struct {
 	IP      net.IP
 	Expires time.Time
+}
+
+// Reservation describes optional static lease and PXE overrides for a MAC address.
+type Reservation struct {
+	IP          string
+	PXEBootFile string // optional per-client PXE boot file
 }
 
 // New creates a DHCP server. serverAddr is in CIDR notation (e.g. "10.0.0.1/24").
@@ -89,6 +105,75 @@ func (s *Server) OnLease(cb LeaseCallback) {
 // OnLeaseExpired registers a callback for lease expirations.
 func (s *Server) OnLeaseExpired(cb LeaseExpiredCallback) {
 	s.onLeaseExpired = cb
+}
+
+// SetReservations replaces the static MAC -> IP reservation map.
+// MAC addresses are normalized to lower-case xx:xx:xx:xx:xx:xx.
+// Reservations outside this server's subnet are ignored so a reservation
+// for one VLAN is not accidentally served by another VLAN's DHCP server.
+func (s *Server) SetReservations(reservations map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reservations = make(map[string]net.IP, len(reservations))
+	subnet := &net.IPNet{IP: s.serverIP.Mask(s.mask), Mask: s.mask}
+	for mac, ip := range reservations {
+		parsed := net.ParseIP(ip).To4()
+		if parsed == nil {
+			continue
+		}
+		if !subnet.Contains(parsed) {
+			continue
+		}
+		s.reservations[normalizeMAC(mac)] = parsed
+	}
+}
+
+// SetPXEOptions configures DHCP option 66 (TFTP server) and 67 (boot file).
+func (s *Server) SetPXEOptions(bootServer string, bootFile string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pxeBootServer = nil
+	if bootServer != "" {
+		if ip := net.ParseIP(bootServer).To4(); ip != nil {
+			s.pxeBootServer = ip
+		}
+	}
+	s.pxeBootFile = bootFile
+}
+
+// SetMacPXEBootFiles replaces the per-client DHCP option 67 bootfile map.
+func (s *Server) SetMacPXEBootFiles(m map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.macPXEBootFiles = make(map[string]string, len(m))
+	for mac, file := range m {
+		s.macPXEBootFiles[normalizeMAC(mac)] = file
+	}
+}
+
+// SetIPXEBootFile sets the bootfile offered to clients that identify as iPXE.
+func (s *Server) SetIPXEBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ipxeBootFile = file
+}
+
+// SetUEFIBootFile sets the bootfile offered to UEFI PXE clients.
+func (s *Server) SetUEFIBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uefiBootFile = file
+}
+
+// SetLegacyBootFile sets the bootfile offered to legacy BIOS PXE clients.
+func (s *Server) SetLegacyBootFile(file string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.legacyBootFile = file
+}
+
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mac, "-", ":")))
 }
 
 // Run starts the DHCP server. It blocks until an error occurs.
@@ -195,10 +280,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 
 	var resp *dhcpv4.DHCPv4
 	var err error
+	opts := s.replyOptions(mac, req)
 
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover:
 		ip := s.allocate(mac)
+		if ip == nil {
+			log.Printf("dhcp: pool exhausted, no free address for %s", mac)
+			return
+		}
 		resp, err = dhcpv4.NewReplyFromRequest(req,
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeOffer),
 			dhcpv4.WithServerIP(s.serverIP),
@@ -208,9 +298,14 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
 			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
+			opts,
 		)
 	case dhcpv4.MessageTypeRequest:
 		ip := s.allocate(mac)
+		if ip == nil {
+			log.Printf("dhcp: pool exhausted, no free address for %s", mac)
+			return
+		}
 		resp, err = dhcpv4.NewReplyFromRequest(req,
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
 			dhcpv4.WithServerIP(s.serverIP),
@@ -220,6 +315,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
 			dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(s.lease)),
 			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
+			opts,
 		)
 		log.Printf("dhcp: ACK %s -> %s", mac, ip)
 	default:
@@ -250,22 +346,42 @@ func (s *Server) allocate(mac string) net.IP {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	normalized := normalizeMAC(mac)
+
+	// Honor static reservation first.
+	if reserved, ok := s.reservations[normalized]; ok {
+		// Ensure an expired dynamic lease for that IP is not handed out to someone else.
+		s.clearLeasesForIP(reserved)
+		s.leases[mac] = lease{IP: dupIP(reserved), Expires: time.Now().Add(s.lease)}
+		if s.onLease != nil {
+			go s.onLease(dupIP(reserved), mac)
+		}
+		return reserved
+	}
+
 	// Return existing lease if valid.
 	if l, ok := s.leases[mac]; ok && time.Now().Before(l.Expires) {
 		return l.IP
 	}
 
-	// Find next free IP.
-	ip := dupIP(s.nextIP)
+	// Find next free IP. Scan until we complete a full pool cycle; if every
+	// address is leased or reserved, allocation must fail rather than hand out
+	// a duplicate.
+	start := dupIP(s.nextIP)
+	ip := start
 	for {
-		if !s.isLeased(ip) {
+		if !s.isLeasedOrReserved(ip) {
 			break
 		}
-		ip = incIP(ip)
-		if ip.Equal(s.rangeEnd) || ipGreater(ip, s.rangeEnd) {
-			ip = dupIP(s.rangeStart) // wrap around
-			break
+		next := incIP(ip)
+		if ipGreater(next, s.rangeEnd) {
+			next = dupIP(s.rangeStart)
 		}
+		if next.Equal(start) {
+			// Full pool cycle completed without finding a free address.
+			return nil
+		}
+		ip = next
 	}
 
 	s.leases[mac] = lease{IP: dupIP(ip), Expires: time.Now().Add(s.lease)}
@@ -282,11 +398,79 @@ func (s *Server) allocate(mac string) net.IP {
 	return ip
 }
 
-func (s *Server) isLeased(ip net.IP) bool {
+func (s *Server) isLeasedOrReserved(ip net.IP) bool {
+	for _, reserved := range s.reservations {
+		if reserved.Equal(ip) {
+			return true
+		}
+	}
 	for _, l := range s.leases {
 		if l.IP.Equal(ip) && time.Now().Before(l.Expires) {
 			return true
 		}
+	}
+	return false
+}
+
+func (s *Server) clearLeasesForIP(ip net.IP) {
+	for mac, l := range s.leases {
+		if l.IP.Equal(ip) {
+			delete(s.leases, mac)
+		}
+	}
+}
+
+func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
+	return func(d *dhcpv4.DHCPv4) {
+		s.mu.Lock()
+		bootServer := s.pxeBootServer
+		bootFile := s.pxeBootFile
+		macFile, hasMacFile := s.macPXEBootFiles[normalizeMAC(mac)]
+		ipxe := s.ipxeBootFile
+		uefi := s.uefiBootFile
+		legacy := s.legacyBootFile
+		s.mu.Unlock()
+
+		classified := ""
+		switch {
+		case ipxe != "" && req != nil && isIPXEClient(req):
+			bootFile = ipxe
+			classified = "ipxe"
+		case hasMacFile:
+			bootFile = macFile
+			classified = "mac"
+		case uefi != "" && req != nil && isUEFIClient(req):
+			bootFile = uefi
+			classified = "uefi"
+		case legacy != "":
+			bootFile = legacy
+			classified = "legacy"
+		}
+
+		if bootServer != nil {
+			log.Printf("dhcp: %s sending option 66 tftp=%s option 67 bootfile=%s", mac, bootServer, bootFile)
+			d.UpdateOption(dhcpv4.OptTFTPServerName(bootServer.String()))
+		}
+		if bootFile != "" {
+			log.Printf("dhcp: %s selected %s bootfile=%s", mac, classified, bootFile)
+			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
+		}
+	}
+}
+
+func isIPXEClient(req *dhcpv4.DHCPv4) bool {
+	uc := req.Options.Get(dhcpv4.OptionUserClassInformation)
+	return len(uc) > 0 && bytes.Contains(bytes.ToLower(uc), []byte("ipxe"))
+}
+
+func isUEFIClient(req *dhcpv4.DHCPv4) bool {
+	archBytes := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
+	if len(archBytes) < 2 {
+		return false
+	}
+	switch binary.BigEndian.Uint16(archBytes) {
+	case 7, 9:
+		return true
 	}
 	return false
 }

@@ -1,3 +1,5 @@
-gokrazy-router
-gokrazy-router-status
-hostapd-arm
+/gokrazy-router
+/router-cli
+/hostapd-arm
+/gokrazy-router-arm
+/milkv-usbnet

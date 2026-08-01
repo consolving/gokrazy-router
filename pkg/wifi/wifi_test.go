@@ -66,6 +66,7 @@ func TestConfTemplate(t *testing.T) {
 		VLANFile      string
 		AcceptMACFile string
 		VLANBridge    string
+		CtrlPath      string
 	}{
 		WiFiConfig: config.WiFiConfig{
 			Interface:   "wlan0",
@@ -76,7 +77,8 @@ func TestConfTemplate(t *testing.T) {
 			CountryCode: "DE",
 			WPA:         2,
 		},
-		Bridge: "br-lan",
+		Bridge:   "br-lan",
+		CtrlPath: ctrlPath,
 	}
 
 	var buf bytes.Buffer
@@ -113,6 +115,7 @@ func TestConfTemplateNoBridge(t *testing.T) {
 		VLANFile      string
 		AcceptMACFile string
 		VLANBridge    string
+		CtrlPath      string
 	}{
 		WiFiConfig: config.WiFiConfig{
 			Interface:  "wlan0",
@@ -122,6 +125,7 @@ func TestConfTemplateNoBridge(t *testing.T) {
 			Channel:    1,
 			WPA:        2,
 		},
+		CtrlPath: ctrlPath,
 	}
 
 	var buf bytes.Buffer
@@ -141,6 +145,7 @@ func TestConfTemplateDynamicVLAN(t *testing.T) {
 		VLANFile      string
 		AcceptMACFile string
 		VLANBridge    string
+		CtrlPath      string
 	}{
 		WiFiConfig: config.WiFiConfig{
 			Interface:  "wlan0",
@@ -154,6 +159,7 @@ func TestConfTemplateDynamicVLAN(t *testing.T) {
 		VLANFile:      "/tmp/hostapd.vlan",
 		AcceptMACFile: "/tmp/hostapd.accept",
 		VLANBridge:    "br-vlan",
+		CtrlPath:      ctrlPath,
 	}
 
 	var buf bytes.Buffer
