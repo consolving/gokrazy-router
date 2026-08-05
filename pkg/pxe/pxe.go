@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ const (
 	tftpDATA = 3
 	tftpACK  = 4
 	tftpERR  = 5
+	tftpOACK = 6
 
 	tftpBlockSize = 512
 	tftpRetries   = 12
@@ -31,19 +33,21 @@ const (
 // (the server-side transfer ID, per RFC 1350) and its own transfer state, so
 // concurrent or duplicate requests from the same client do not interfere.
 type transfer struct {
-	once    sync.Once
-	mu      sync.Mutex
-	client  *net.UDPAddr
-	conn    *net.UDPConn
-	block1  []byte
-	initial chan struct{} // closed once conn+block1 are ready (or the transfer aborted)
+	once      sync.Once
+	mu        sync.Mutex
+	client    *net.UDPAddr
+	conn      *net.UDPConn
+	block1    []byte
+	blockSize int
+	initial   chan struct{} // closed once conn+block1 are ready (or the transfer aborted)
 }
 
-func (t *transfer) setReady(conn *net.UDPConn, block1 []byte) {
+func (t *transfer) setReady(conn *net.UDPConn, block1 []byte, blockSize int) {
 	t.once.Do(func() {
 		t.mu.Lock()
 		t.conn = conn
 		t.block1 = block1
+		t.blockSize = blockSize
 		t.mu.Unlock()
 		close(t.initial)
 	})
@@ -165,7 +169,7 @@ func (s *Server) Start() error {
 // SO_BINDTODEVICE. A nil/zero IP binds all local addresses.
 func listenUDPOn(addr *net.UDPAddr, iface string) (*net.UDPConn, error) {
 	if iface == "" {
-		return net.ListenUDP("udp", addr)
+		return net.ListenUDP("udp4", addr)
 	}
 
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
@@ -214,7 +218,8 @@ func (s *Server) reader(conn *net.UDPConn, root string) {
 
 		switch binary.BigEndian.Uint16(pkt[:2]) {
 		case tftpRRQ:
-			filename, _ := cstring(pkt[2:])
+			filename, mode, opts := parseRRQ(pkt)
+			filename = sanitizeTFTPName(filename)
 			if filename == "" {
 				continue
 			}
@@ -227,8 +232,12 @@ func (s *Server) reader(conn *net.UDPConn, root string) {
 				existing.(*transfer).resendBlock1()
 				continue
 			}
-			log.Printf("pxe: received RRQ for %s from %s", filename, client)
-			go s.serveFile(conn, root, key, st, filename)
+			if len(opts) > 0 {
+				log.Printf("pxe: received RRQ for %s from %s mode=%s opts=%v", filename, client, mode, opts)
+			} else {
+				log.Printf("pxe: received RRQ for %s from %s", filename, client)
+			}
+			go s.serveFile(conn, root, key, st, filename, opts)
 		case tftpACK:
 			// ACKs are sent to the per-transfer socket, never to the control
 			// socket. A stray ACK here belongs to no transfer; drop it.
@@ -240,7 +249,7 @@ func (s *Server) reader(conn *net.UDPConn, root string) {
 
 // serveFile resolves the request, opens the file inside the TFTP root and
 // streams it to the client from a dedicated transfer socket.
-func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer, filename string) {
+func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer, filename string, opts map[string]string) {
 	defer s.active.Delete(key)
 	defer st.abort()
 
@@ -259,6 +268,30 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 	}
 	defer f.Close()
 
+	// Determine file size for tsize option negotiation.
+	fi, err := f.Stat()
+	if err != nil {
+		log.Printf("pxe: cannot stat %s: %v", filename, err)
+		sendERR(control, st.client, 1, "Server error")
+		return
+	}
+	fileSize := fi.Size()
+
+	// Negotiate RFC 2347 options. The most common request from UEFI PXE
+	// firmware is blksize=1468; we honor it up to the Ethernet MTU payload.
+	blockSize := tftpBlockSize
+	if bs, ok := opts["blksize"]; ok {
+		if req, err := strconv.Atoi(bs); err == nil && req > 0 {
+			const maxBlockSize = 1468
+			if req > maxBlockSize {
+				req = maxBlockSize
+			}
+			blockSize = req
+		}
+	}
+
+	oack := buildOACK(opts, blockSize, fileSize)
+
 	// Each transfer gets its own UDP socket. DATA is sent from this socket and
 	// ACKs are only accepted from the full client IP:port, which is how TFTP
 	// transfer IDs work and what isolates concurrent transfers from each other.
@@ -270,10 +303,19 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 	}
 	defer conn.Close()
 
-	log.Printf("pxe: sending %s (requested %s) via %s", rel, filename, conn.LocalAddr())
+	// If the client requested options, send OACK and wait for the ACK of
+	// block 0 before starting the data transfer.
+	if len(oack) > 0 {
+		if err := sendOACK(conn, st, oack); err != nil {
+			log.Printf("pxe: OACK error for %s: %v", filename, err)
+			return
+		}
+	}
+
+	log.Printf("pxe: sending %s (requested %s) via %s blocksize=%d", rel, filename, conn.LocalAddr(), blockSize)
 
 	block := uint16(1)
-	data := make([]byte, 4+tftpBlockSize)
+	data := make([]byte, 4+blockSize)
 	data[0] = 0
 	data[1] = tftpDATA
 
@@ -288,7 +330,7 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 		if block == 1 {
 			block1 := make([]byte, len(payload))
 			copy(block1, payload)
-			st.setReady(conn, block1)
+			st.setReady(conn, block1, blockSize)
 		}
 
 		if err := sendBlock(conn, st, payload, block); err != nil {
@@ -296,7 +338,7 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 			return
 		}
 
-		if n < tftpBlockSize {
+		if n < blockSize {
 			log.Printf("pxe: completed %s (%d blocks)", rel, int(block))
 			return
 		}
@@ -304,11 +346,101 @@ func (s *Server) serveFile(control *net.UDPConn, root, key string, st *transfer,
 	}
 }
 
+// buildOACK constructs an RFC 2347 option-acknowledgment packet. It echoes
+// back negotiated values for blksize and tsize if the client requested them.
+// Returns nil when no options need to be acknowledged.
+func buildOACK(opts map[string]string, blockSize int, fileSize int64) []byte {
+	if len(opts) == 0 {
+		return nil
+	}
+
+	var pairs []string
+	if _, ok := opts["blksize"]; ok {
+		pairs = append(pairs, "blksize", strconv.Itoa(blockSize))
+	}
+	if _, ok := opts["tsize"]; ok {
+		pairs = append(pairs, "tsize", strconv.FormatInt(fileSize, 10))
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	size := 2
+	for _, s := range pairs {
+		size += len(s) + 1
+	}
+	pkt := make([]byte, 0, size)
+	pkt = append(pkt, 0, tftpOACK)
+	for _, s := range pairs {
+		pkt = append(pkt, s...)
+		pkt = append(pkt, 0)
+	}
+	return pkt
+}
+
+// sendOACK transmits the OACK packet and waits for the client to ACK block 0,
+// confirming acceptance of the negotiated options.
+func sendOACK(conn *net.UDPConn, st *transfer, oack []byte) error {
+	for i := 0; i < tftpRetries; i++ {
+		if _, err := conn.WriteToUDP(oack, st.client); err != nil {
+			return err
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(tftpTimeout)); err != nil {
+			return err
+		}
+		ack, err := waitForAck(conn, st.client, 0)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return err
+		}
+		if ack {
+			return nil
+		}
+	}
+	return fmt.Errorf("timeout after %d retries", tftpRetries)
+}
+
 func (s *Server) listenTransfer(client *net.UDPAddr) (*net.UDPConn, error) {
 	s.mu.RLock()
 	iface := s.cfg.BindInterface
 	s.mu.RUnlock()
-	return listenUDPOn(&net.UDPAddr{IP: net.IPv4zero, Port: 0}, iface)
+
+	addr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if iface != "" {
+		// Bind to the interface's primary IPv4 address so the TFTP DATA
+		// packets leave with a source IP that matches the DHCP option 66
+		// TFTP server address. Some PXE clients ignore replies that do not
+		// originate from the expected server IP.
+		if ip, err := ifaceIPv4(iface); err != nil {
+			log.Printf("pxe: bind interface %s has no IPv4 address, falling back to 0.0.0.0: %v", iface, err)
+		} else {
+			addr.IP = ip
+		}
+	}
+	return listenUDPOn(addr, iface)
+}
+
+// ifaceIPv4 returns the first IPv4 address assigned to the named interface.
+func ifaceIPv4(name string) (net.IP, error) {
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok {
+			if ip4 := ipnet.IP.To4(); ip4 != nil {
+				return ip4, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no IPv4 address on %s", name)
 }
 
 // sendBlock transmits one DATA block and waits for the matching ACK,
@@ -368,6 +500,25 @@ func sendERR(conn *net.UDPConn, addr *net.UDPAddr, code uint16, msg string) {
 	conn.WriteToUDP(pkt, addr)
 }
 
+// parseRRQ extracts the filename, mode and any RFC 2347 options from a TFTP
+// read-request packet. Options are returned as a map for diagnostics; the
+// server currently does not negotiate them.
+func parseRRQ(pkt []byte) (filename, mode string, opts map[string]string) {
+	filename, rest := cstring(pkt[2:])
+	mode, rest = cstring(rest)
+	opts = make(map[string]string)
+	for len(rest) > 0 {
+		key, r := cstring(rest)
+		val, r2 := cstring(r)
+		if key == "" {
+			break
+		}
+		opts[strings.ToLower(key)] = val
+		rest = r2
+	}
+	return filename, mode, opts
+}
+
 func cstring(b []byte) (string, []byte) {
 	for i, v := range b {
 		if v == 0 {
@@ -375,6 +526,20 @@ func cstring(b []byte) (string, []byte) {
 		}
 	}
 	return "", nil
+}
+
+// sanitizeTFTPName strips trailing non-printable bytes from a requested TFTP
+// filename. Some UEFI PXE firmware implementations (Intel UNDI PXE-2.1 era,
+// Realtek NICs) misparse DHCP option 67 as a NUL-terminated string and append
+// junk bytes -- typically 0xff -- to the TFTP RRQ filename. This mirrors the
+// tftpd-hpa remap workaround ("r (.*)[^0-9A-Za-z._-]$ \1").
+func sanitizeTFTPName(name string) string {
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] >= 0x20 && name[i] < 0x7f {
+			return name[:i+1]
+		}
+	}
+	return ""
 }
 
 // resolveImage maps a requested TFTP filename to a serving image. Requests
