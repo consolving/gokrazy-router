@@ -159,6 +159,63 @@ func buildACK(block uint16) []byte {
 	return pkt
 }
 
+func TestSanitizeTFTPName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"netboot.xyz.efi", "netboot.xyz.efi"},
+		{"netboot.xyz.efi\xff", "netboot.xyz.efi"},
+		{"netboot.xyz.efi\xff\xff\x00", "netboot.xyz.efi"},
+		{"menu.ipxe", "menu.ipxe"},
+		{"\xff\xfe", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeTFTPName(c.in); got != c.want {
+			t.Errorf("sanitizeTFTPName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestTFTPTrailingJunkByte verifies the UEFI PXE firmware workaround: some
+// clients append junk bytes (typically 0xff) to the requested filename, which
+// must be ignored instead of failing with "file not found".
+func TestTFTPTrailingJunkByte(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "boot.img"), []byte("pxeboot"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, client, srvAddr := startTestServer(t, root, nil)
+
+	rq := []byte{0, tftpRRQ}
+	rq = append(rq, "boot.img"...)
+	rq = append(rq, 0xff, 0)
+	rq = append(rq, "octet"...)
+	rq = append(rq, 0)
+	if _, err := client.WriteToUDP(rq, srvAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1500)
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, from, err := client.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read DATA: %v", err)
+	}
+	if n < 4 || binary.BigEndian.Uint16(buf[:2]) != tftpDATA {
+		t.Fatalf("expected DATA op=3, got op=%d", binary.BigEndian.Uint16(buf[:2]))
+	}
+	if binary.BigEndian.Uint16(buf[2:4]) != 1 {
+		t.Fatalf("first DATA block = %d, want 1", binary.BigEndian.Uint16(buf[2:4]))
+	}
+	if payload := buf[4:n]; string(payload) != "pxeboot" {
+		t.Fatalf("received %q, want %q", payload, "pxeboot")
+	}
+	if _, err := client.WriteToUDP(buildACK(1), from); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTFTPTransfer(t *testing.T) {
 	root := t.TempDir()
 	content := make([]byte, 1500)

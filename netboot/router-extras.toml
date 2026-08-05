@@ -9,6 +9,10 @@
 # Changes to [vlanAddresses] and [[smbUsers]] require a router restart and are
 # rejected by /api/reload with HTTP 409.
 
+# VLAN address overrides (VLAN ID -> CIDR). Applied on router startup.
+[vlanAddresses]
+31 = "10.0.31.129/25"
+
 # Static DHCP reservations (MAC -> IP). Only applied to the matching subnet.
 [reservations]
 "5c:ff:35:0d:b3:49" = "10.0.31.150"
@@ -19,16 +23,21 @@ dns = ["1.1.1.1", "8.8.8.8", "1.0.0.1"]
 
 # Per-MAC PXE image file name. The requested TFTP filename is matched
 # against the client MAC address. This is the ONLY way to give a client a
-# non-default boot flow: the ThinkPad T410i (legacy BIOS) is the only client
-# that should get the iPXE chain (undionly.kpxe -> boot.ipxe -> netboot.xyz).
+# non-default boot flow: the ThinkPad T410i and Fujitsu Esprimo (legacy BIOS)
+# get the iPXE chain (undionly.kpxe -> boot.ipxe -> netboot.xyz).
 # Everything else defaults to the UEFI bootloader netboot.xyz.efi.
 [macImages]
 "5c:ff:35:0d:b3:49" = "undionly.kpxe"
+"82:78:97:41:e1:db" = "netboot.xyz.img"
+"16:7e:67:eb:ac:e1" = "undionly.kpxe"
+"90:1b:0e:3e:ba:d6" = "netboot.xyz.efi"
 
 # PXE boot file selection. These override the global services.pxe defaults.
-# Default boot file is the UEFI netboot.xyz.efi; legacy-BIOS clients without
-# a MAC entry get the same boot file (no iPXE chain for them).
+# Default boot file is the UEFI netboot.xyz.efi. Legacy-BIOS PXE clients
+# (no DHCP option 93) get undionly.kpxe so they chain iPXE ->
+# boot.ipxe -> netboot.xyz menu (validated on ThinkPad T410i and
+# Fujitsu Esprimo legacy clients).
 pxeBootFile = "netboot.xyz.efi"
-legacyBootFile = "netboot.xyz.efi"
+legacyBootFile = "undionly.kpxe"
 uefiBootFile = "netboot.xyz.efi"
 ipxeScript = "boot.ipxe"

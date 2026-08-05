@@ -270,6 +270,7 @@ func (s *Server) reapExpiredLeases() {
 }
 
 func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4) {
+	log.Printf("dhcp: === %s mac=%s peer=%s ===", req.MessageType(), req.ClientHWAddr, peer)
 	log.Printf("dhcp: received %s from %s (hw=%s)", req.MessageType(), peer, req.ClientHWAddr)
 	if req.OpCode != dhcpv4.OpcodeBootRequest {
 		return
