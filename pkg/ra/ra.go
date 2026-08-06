@@ -72,10 +72,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("ra: interface %s: %w", s.cfg.Interface, err)
 	}
-	if err := ensureLinkLocal(ifi); err != nil {
+	ll, err := ensureLinkLocal(ifi)
+	if err != nil {
 		return fmt.Errorf("ra: %s: %w", s.cfg.Interface, err)
 	}
-	conn, src, err := ndp.Listen(ifi, ndp.LinkLocal)
+	conn, src, err := ndp.Listen(ifi, ndp.Addr(ll.String()))
 	if err != nil {
 		return fmt.Errorf("ra: listen on %s: %w", s.cfg.Interface, err)
 	}
@@ -92,59 +93,48 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// ensureLinkLocal guarantees the interface has a usable link-local IPv6
-// address so the NDP listener can bind. Right after a global address is
-// assigned, the kernel generates fe80:: asynchronously via addrconf, and the
-// address stays tentative (unbindable) while DAD runs, so we poll until a
-// non-tentative link-local address exists. If addrconf never produces one,
-// we install fe80::1 explicitly.
-func ensureLinkLocal(ifi *net.Interface) error {
+// ensureLinkLocal guarantees the interface has a bindable link-local IPv6
+// address for the NDP listener. The kernel generates fe80:: asynchronously
+// via addrconf and keeps it tentative (unbindable) while DAD runs, so we
+// install fe80::1 with the NODAD flag instead: it is immediately usable and
+// does not depend on addrconf timing or DAD state.
+func ensureLinkLocal(ifi *net.Interface) (netip.Addr, error) {
 	link, err := netlink.LinkByName(ifi.Name)
 	if err != nil {
-		return fmt.Errorf("lookup %s: %w", ifi.Name, err)
-	}
-
-	for i := 0; i < 100; i++ {
-		if usableLinkLocal(link) != nil {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+		return netip.Addr{}, fmt.Errorf("lookup %s: %w", ifi.Name, err)
 	}
 
 	ll, err := netlink.ParseAddr("fe80::1/64")
 	if err != nil {
-		return fmt.Errorf("parse fe80::1/64: %w", err)
+		return netip.Addr{}, fmt.Errorf("parse fe80::1/64: %w", err)
 	}
+	ll.Flags = unix.IFA_F_NODAD
 	if err := netlink.AddrAdd(link, ll); err != nil && !errors.Is(err, unix.EEXIST) {
-		return fmt.Errorf("assign fe80::1/64 to %s: %w", ifi.Name, err)
+		return netip.Addr{}, fmt.Errorf("assign fe80::1/64 to %s: %w", ifi.Name, err)
 	}
-	for i := 0; i < 100; i++ {
-		if usableLinkLocal(link) != nil {
-			return nil
+
+	// Wait for the address to be reported back before handing it to the NDP
+	// listener.
+	for i := 0; i < 50; i++ {
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+		if err != nil {
+			break
+		}
+		for _, a := range addrs {
+			ip := a.IP.To16()
+			if ip == nil || !ip.IsLinkLocalUnicast() {
+				continue
+			}
+			if !ip.Equal(net.ParseIP("fe80::1")) {
+				continue
+			}
+			var b [16]byte
+			copy(b[:], ip)
+			return netip.AddrFrom16(b).WithZone(ifi.Name), nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
-}
-
-// usableLinkLocal returns a non-tentative link-local unicast address of the
-// interface, or nil while none exists or DAD is still in progress.
-func usableLinkLocal(link netlink.Link) net.IP {
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
-	if err != nil {
-		return nil
-	}
-	for _, a := range addrs {
-		ip := a.IP.To16()
-		if ip == nil || !ip.IsLinkLocalUnicast() {
-			continue
-		}
-		if a.Flags&unix.IFA_F_TENTATIVE != 0 {
-			continue
-		}
-		return ip
-	}
-	return nil
+	return netip.Addr{}, fmt.Errorf("fe80::1/64 not present on %s", ifi.Name)
 }
 
 func (s *Server) loop() {
