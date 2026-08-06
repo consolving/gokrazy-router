@@ -39,6 +39,17 @@ func solicitWithoutArch(t *testing.T) *dhcpv6.Message {
 	return m
 }
 
+func solicitWithUserClass(t *testing.T, class string, archs ...iana.Arch) *dhcpv6.Message {
+	t.Helper()
+	m, err := dhcpv6.NewSolicit(net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03},
+		dhcpv6.WithOption(dhcpv6.OptClientArchType(archs...)),
+		dhcpv6.WithUserClass([]byte(class)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
 func TestDHCP6PXEBootfileSelection(t *testing.T) {
 	s := newTestDHCP6Server()
 	s.SetPXEBootFile6(net.ParseIP("fd00::1"), "undionly.kpxe", "netboot.xyz.efi")
@@ -53,6 +64,8 @@ func TestDHCP6PXEBootfileSelection(t *testing.T) {
 		{"UEFI ARM64", solicitWithArch(t, iana.EFI_ARM64), "tftp://[fd00::1]/netboot.xyz.efi"},
 		{"dual-stack prefers UEFI", solicitWithArch(t, iana.INTEL_X86PC, iana.EFI_X86_64), "tftp://[fd00::1]/netboot.xyz.efi"},
 		{"no arch, no URL", solicitWithoutArch(t), ""},
+		{"legacy iPXE, no URL", solicitWithUserClass(t, "iPXE", iana.INTEL_X86PC), ""},
+		{"UEFI iPXE, no URL", solicitWithUserClass(t, "iPXE", iana.EFI_X86_64), ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

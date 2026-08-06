@@ -1,6 +1,7 @@
 package ra
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -227,8 +228,15 @@ func (s *DHCP6Server) modifiers(msg *dhcpv6.Message, addr net.IP) []dhcpv6.Modif
 
 // pxeBootfileURL returns the option 59 bootfile URL for a netboot client, or
 // an empty string when the client did not advertise its architecture (option
-// 61) or no matching boot file is configured.
+// 61), is an iPXE client, or no matching boot file is configured.
 func (s *DHCP6Server) pxeBootfileURL(msg *dhcpv6.Message) string {
+	// iPXE clients already received their boot script through IPv4 DHCP.
+	// Offering the option 59 URL would make them chain-load the iPXE binary
+	// again (via IPv6 TFTP, which this server does not listen on) and
+	// boot-loop.
+	if ipxeClient(msg) {
+		return ""
+	}
 	archs := clientArchs(msg)
 	if len(archs) == 0 || s.pxe6Server == nil {
 		return ""
@@ -265,6 +273,19 @@ func clientArchs(msg *dhcpv6.Message) []uint16 {
 // {0, 7} from a UEFI machine with CSM enabled) is served the UEFI boot file.
 func clientIsLegacy(archs []uint16) bool {
 	return len(archs) == 1 && archs[0] == uint16(iana.INTEL_X86PC)
+}
+
+// ipxeClient reports whether the client identifies as iPXE via its DHCPv6
+// user class (option 15). Such clients must not be handed an option 59
+// bootfile URL: they have already chain-loaded from IPv4 DHCP and re-booting
+// the iPXE binary from the DHCPv6 URL would loop.
+func ipxeClient(msg *dhcpv6.Message) bool {
+	for _, uc := range msg.Options.UserClasses() {
+		if bytes.EqualFold(bytes.TrimSpace(uc), []byte("iPXE")) {
+			return true
+		}
+	}
+	return false
 }
 
 // allocate returns the IA_NA address for a client, allocating a new one from
