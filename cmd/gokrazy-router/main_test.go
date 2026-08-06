@@ -12,6 +12,41 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/pxe"
 )
 
+func TestApplyGlobalDNS6(t *testing.T) {
+	global := []string{"2606:4700:4700::1111", "2001:4860:4860::8888"}
+
+	// Scope without a dns6 inherits the global default.
+	cfg := config.Default()
+	cfg.DNS6 = global
+	cfg.VLANs = []config.VLANConfig{{ID: 31}}
+	applyGlobalDNS6(cfg)
+	if len(cfg.LAN.DNS6) != len(global) || cfg.LAN.DNS6[0] != global[0] {
+		t.Errorf("LAN.DNS6 not inherited: %v", cfg.LAN.DNS6)
+	}
+	if len(cfg.VLANs[0].DNS6) != len(global) || cfg.VLANs[0].DNS6[0] != global[0] {
+		t.Errorf("VLAN.DNS6 not inherited: %v", cfg.VLANs[0].DNS6)
+	}
+	if len(cfg.WiFi.DNS6) != len(global) {
+		t.Errorf("WiFi.DNS6 not inherited: %v", cfg.WiFi.DNS6)
+	}
+
+	// A scope with an explicit empty (non-nil) dns6 advertises no IPv6 DNS.
+	cfg = config.Default()
+	cfg.DNS6 = global
+	cfg.VLANs = []config.VLANConfig{{ID: 31, DNS6: []string{}}}
+	cfg.WiFi.DNS6 = []string{}
+	applyGlobalDNS6(cfg)
+	if cfg.VLANs[0].DNS6 == nil || len(cfg.VLANs[0].DNS6) != 0 {
+		t.Errorf("VLAN empty dns6 overwritten: %v", cfg.VLANs[0].DNS6)
+	}
+	if cfg.WiFi.DNS6 == nil || len(cfg.WiFi.DNS6) != 0 {
+		t.Errorf("WiFi empty dns6 overwritten: %v", cfg.WiFi.DNS6)
+	}
+	if len(cfg.LAN.DNS6) == 0 {
+		t.Errorf("LAN should have inherited global dns6, got %v", cfg.LAN.DNS6)
+	}
+}
+
 func TestMergedReservations(t *testing.T) {
 	got := mergedReservations(
 		map[string]string{"aa:bb:cc:dd:ee:01": "10.0.0.50", "aa:bb:cc:dd:ee:02": "10.0.0.51"},

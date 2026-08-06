@@ -72,19 +72,8 @@ func main() {
 	}
 
 	// Apply global IPv6 DNS default to all RA/DHCPv6 scopes that don't have one.
-	if len(cfg.DNS6) > 0 {
-		if len(cfg.LAN.DNS6) == 0 {
-			cfg.LAN.DNS6 = append([]string(nil), cfg.DNS6...)
-		}
-		for i := range cfg.VLANs {
-			if len(cfg.VLANs[i].DNS6) == 0 {
-				cfg.VLANs[i].DNS6 = append([]string(nil), cfg.DNS6...)
-			}
-		}
-		if len(cfg.WiFi.DNS6) == 0 {
-			cfg.WiFi.DNS6 = append([]string(nil), cfg.DNS6...)
-		}
-	}
+	// A scope explicitly configured with "dns6": [] advertises no IPv6 DNS.
+	applyGlobalDNS6(cfg)
 
 	// Immutable snapshot of the base JSON config, taken before any extras are
 	// merged. Reloads derive effective per-scope state (e.g. reservations)
@@ -792,6 +781,26 @@ func (r *reloader) checkRestartRequired(extras *config.ExtrasConfig) error {
 		return &restartRequiredError{msg: "smbUsers changed: SMB user changes require a router restart"}
 	}
 	return nil
+}
+
+// applyGlobalDNS6 applies the global IPv6 DNS default to every RA/DHCPv6 scope
+// whose DNS6 is nil. A scope explicitly set to an empty (non-nil) list — e.g.
+// "dns6": [] in router.json — advertises no IPv6 DNS and is left untouched.
+func applyGlobalDNS6(cfg *config.Config) {
+	if len(cfg.DNS6) == 0 {
+		return
+	}
+	if cfg.LAN.DNS6 == nil {
+		cfg.LAN.DNS6 = append([]string(nil), cfg.DNS6...)
+	}
+	for i := range cfg.VLANs {
+		if cfg.VLANs[i].DNS6 == nil {
+			cfg.VLANs[i].DNS6 = append([]string(nil), cfg.DNS6...)
+		}
+	}
+	if cfg.WiFi.DNS6 == nil {
+		cfg.WiFi.DNS6 = append([]string(nil), cfg.DNS6...)
+	}
 }
 
 // mergedReservations returns base merged with extras; extras win on conflict.
