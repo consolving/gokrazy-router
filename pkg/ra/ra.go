@@ -92,38 +92,57 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// ensureLinkLocal guarantees the interface has a link-local IPv6 address so
-// the NDP listener can bind. Right after a global address is assigned, the
-// kernel generates fe80:: asynchronously via addrconf, so we first wait for
-// it to appear; if it never does, we install fe80::1 explicitly.
+// ensureLinkLocal guarantees the interface has a usable link-local IPv6
+// address so the NDP listener can bind. Right after a global address is
+// assigned, the kernel generates fe80:: asynchronously via addrconf, and the
+// address stays tentative (unbindable) while DAD runs, so we poll until a
+// non-tentative link-local address exists. If addrconf never produces one,
+// we install fe80::1 explicitly.
 func ensureLinkLocal(ifi *net.Interface) error {
-	for i := 0; i < 20; i++ {
-		addrs, err := ifi.Addrs()
-		if err != nil {
-			return err
-		}
-		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			if ip := ipn.IP.To16(); ip != nil && ip.IsLinkLocalUnicast() {
-				return nil
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
 	link, err := netlink.LinkByName(ifi.Name)
 	if err != nil {
 		return fmt.Errorf("lookup %s: %w", ifi.Name, err)
 	}
+
+	for i := 0; i < 100; i++ {
+		if usableLinkLocal(link) != nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	ll, err := netlink.ParseAddr("fe80::1/64")
 	if err != nil {
 		return fmt.Errorf("parse fe80::1/64: %w", err)
 	}
 	if err := netlink.AddrAdd(link, ll); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("assign fe80::1/64 to %s: %w", ifi.Name, err)
+	}
+	for i := 0; i < 100; i++ {
+		if usableLinkLocal(link) != nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
+// usableLinkLocal returns a non-tentative link-local unicast address of the
+// interface, or nil while none exists or DAD is still in progress.
+func usableLinkLocal(link netlink.Link) net.IP {
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		ip := a.IP.To16()
+		if ip == nil || !ip.IsLinkLocalUnicast() {
+			continue
+		}
+		if a.Flags&unix.IFA_F_TENTATIVE != 0 {
+			continue
+		}
+		return ip
 	}
 	return nil
 }
