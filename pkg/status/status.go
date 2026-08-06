@@ -20,29 +20,30 @@ import (
 
 // PortInfo describes the link state and traffic counters for a network port.
 type PortInfo struct {
-	Name    string      `json:"name"`
-	MAC     string      `json:"mac,omitempty"`
-	Up      bool        `json:"up"`
-	Carrier bool        `json:"carrier"`
-	Speed   int         `json:"speed,omitempty"`  // negotiated link speed in Mbps, 0 if unknown
-	Duplex  string      `json:"duplex,omitempty"` // "full", "half", or ""
-	TxBytes uint64      `json:"txBytes"`
-	RxBytes uint64      `json:"rxBytes"`
-	TxPkts  uint64      `json:"txPackets"`
-	RxPkts  uint64      `json:"rxPackets"`
-	Sub     []PortInfo  `json:"sub,omitempty"` // sub-ports (e.g. lan1-4 under lan)
+	Name    string     `json:"name"`
+	MAC     string     `json:"mac,omitempty"`
+	Up      bool       `json:"up"`
+	Carrier bool       `json:"carrier"`
+	Speed   int        `json:"speed,omitempty"`  // negotiated link speed in Mbps, 0 if unknown
+	Duplex  string     `json:"duplex,omitempty"` // "full", "half", or ""
+	TxBytes uint64     `json:"txBytes"`
+	RxBytes uint64     `json:"rxBytes"`
+	TxPkts  uint64     `json:"txPackets"`
+	RxPkts  uint64     `json:"rxPackets"`
+	Sub     []PortInfo `json:"sub,omitempty"` // sub-ports (e.g. lan1-4 under lan)
 }
 
 // ClientInfo describes a connected client with traffic counters.
 type ClientInfo struct {
 	IP        string `json:"ip"`
+	IP6       string `json:"ip6,omitempty"`
 	MAC       string `json:"mac"`
-	Via       string `json:"via"`      // "L" = LAN, "W" = WiFi, "G" = Gateway (router itself)
+	Via       string `json:"via"` // "L" = LAN, "W" = WiFi, "G" = Gateway (router itself)
 	Connected bool   `json:"connected"`
 
 	// Live counters: current session only (reset on reconnect).
-	TxBytes uint64 `json:"txBytes"`  // bytes sent TO client (download)
-	RxBytes uint64 `json:"rxBytes"`  // bytes sent FROM client (upload)
+	TxBytes uint64 `json:"txBytes"` // bytes sent TO client (download)
+	RxBytes uint64 `json:"rxBytes"` // bytes sent FROM client (upload)
 	TxPkts  uint64 `json:"txPackets"`
 	RxPkts  uint64 `json:"rxPackets"`
 
@@ -62,8 +63,8 @@ type ClientInfo struct {
 	TotalRxPkts  uint64 `json:"totalRxPackets"`
 
 	// Timestamps
-	FirstSeen    string `json:"firstSeen"`
-	LastSeen     string `json:"lastSeen"`
+	FirstSeen string `json:"firstSeen"`
+	LastSeen  string `json:"lastSeen"`
 }
 
 // SummaryInfo provides aggregate TX/RX stats for a category.
@@ -101,14 +102,18 @@ type Monitor struct {
 	mu         sync.Mutex
 	conn       *nftables.Conn
 	table      *nftables.Table
-	chainRx    *nftables.Chain // traffic FROM clients (src match)
-	chainTx    *nftables.Chain // traffic TO clients (dst match)
+	table6     *nftables.Table
+	chainRx    *nftables.Chain        // IPv4 traffic FROM clients (src match)
+	chainTx    *nftables.Chain        // IPv4 traffic TO clients (dst match)
+	chainRx6   *nftables.Chain        // IPv6 traffic FROM clients (src match)
+	chainTx6   *nftables.Chain        // IPv6 traffic TO clients (dst match)
 	clients    map[string]clientEntry // IP -> entry
 	gatewayIPs map[string]bool        // router's own IPs (to mark as "G")
 	wanIface   string
 	lanIface   string   // bridge name (br-lan)
 	lanPorts   []string // individual LAN ports (lan1-lan4)
 	wifiIface  string
+	scanIfaces []string // extra interfaces scanned for IPv6 neighbors (e.g. VLAN bridges)
 
 	// Throughput sampling state.
 	prevSnapshot map[string]counterSnapshot // IP -> previous sample
@@ -143,6 +148,7 @@ type wifiStationInfo struct {
 type clientEntry struct {
 	MAC       string
 	IP        net.IP
+	IP6       net.IP
 	Via       string // "L" or "W"
 	Connected bool
 	FirstSeen time.Time
@@ -185,18 +191,39 @@ func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monit
 		Priority: nftables.ChainPriorityFilter,
 	})
 
+	table6 := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv6,
+		Name:   "gokrazy_stats6",
+	})
+
+	chainRx6 := conn.AddChain(&nftables.Chain{
+		Name:     "client_rx6",
+		Table:    table6,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	chainTx6 := conn.AddChain(&nftables.Chain{
+		Name:     "client_tx6",
+		Table:    table6,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
 	if err := conn.Flush(); err != nil {
 		return nil, fmt.Errorf("status: create nftables table: %w", err)
 	}
 
-	// Collect the router's own IPs to identify gateway entries in client list.
+	// Collect the router's own IPs (v4 and v6) to identify gateway entries.
 	gwIPs := make(map[string]bool)
 	for _, ifname := range []string{lanIface, wifiIface, wanIface} {
 		link, err := netlink.LinkByName(ifname)
 		if err != nil {
 			continue
 		}
-		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
 		if err != nil {
 			continue
 		}
@@ -208,8 +235,11 @@ func New(wanIface, lanIface string, lanPorts []string, wifiIface string) (*Monit
 	m := &Monitor{
 		conn:         conn,
 		table:        table,
+		table6:       table6,
 		chainRx:      chainRx,
 		chainTx:      chainTx,
+		chainRx6:     chainRx6,
+		chainTx6:     chainTx6,
 		clients:      make(map[string]clientEntry),
 		gatewayIPs:   gwIPs,
 		wanIface:     wanIface,
@@ -233,7 +263,7 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ipStr := ip.To4().String()
+	ipStr := ip.String()
 
 	// Mark router's own IPs as gateway.
 	if m.gatewayIPs[ipStr] {
@@ -241,6 +271,23 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	}
 
 	now := time.Now()
+
+	// Attach IPv4 to an existing IPv6-discovered client with the same MAC.
+	if mac != "" {
+		for key, entry := range m.clients {
+			if key == ipStr || !entry.Connected || entry.MAC != mac {
+				continue
+			}
+			entry.IP = ip.To4()
+			entry.LastSeen = now
+			m.clients[key] = entry
+			m.addCounterRulesLocked(ip, false)
+			if err := m.conn.Flush(); err != nil {
+				return fmt.Errorf("status: add counter rules for %s: %w", ipStr, err)
+			}
+			return nil
+		}
+	}
 
 	// If client already exists and is connected, nothing to do.
 	if entry, exists := m.clients[ipStr]; exists {
@@ -265,49 +312,7 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 		}
 	}
 
-	ip4 := ip.To4()
-
-	// Count traffic FROM this client (upload): match src IP
-	m.conn.AddRule(&nftables.Rule{
-		Table: m.table,
-		Chain: m.chainRx,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       12, // src IP
-				Len:          4,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     ip4,
-			},
-			&expr.Counter{},
-		},
-		UserData: []byte(ipStr + "/rx"),
-	})
-
-	// Count traffic TO this client (download): match dst IP
-	m.conn.AddRule(&nftables.Rule{
-		Table: m.table,
-		Chain: m.chainTx,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       16, // dst IP
-				Len:          4,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     ip4,
-			},
-			&expr.Counter{},
-		},
-		UserData: []byte(ipStr + "/tx"),
-	})
+	m.addCounterRulesLocked(ip, false)
 
 	if err := m.conn.Flush(); err != nil {
 		return fmt.Errorf("status: add counter rules for %s: %w", ipStr, err)
@@ -317,6 +322,187 @@ func (m *Monitor) AddClient(ip net.IP, mac, via string) error {
 	return nil
 }
 
+// addCounterRulesLocked adds rx/tx counter rules for a client address in the
+// appropriate address family. Caller must hold m.mu.
+func (m *Monitor) addCounterRulesLocked(ip net.IP, isV6 bool) {
+	rxChain, txChain := m.chainRx, m.chainTx
+	table := m.table
+	var offset, dstOffset uint32
+	n := uint32(4) // IPv4 src/dst length
+	suffix := ""
+	data := ip.To4()
+	if isV6 {
+		rxChain, txChain = m.chainRx6, m.chainTx6
+		table = m.table6
+		offset, dstOffset, n = 8, 24, 16 // IPv6 src/dst
+		suffix = "6"
+		data = ip.To16()
+	}
+	ipStr := ip.String()
+
+	// Count traffic FROM this client (upload): match src IP
+	m.conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: rxChain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       offset,
+				Len:          n,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     data,
+			},
+			&expr.Counter{},
+		},
+		UserData: []byte(ipStr + "/rx" + suffix),
+	})
+
+	// Count traffic TO this client (download): match dst IP
+	m.conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: txChain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       dstOffset,
+				Len:          n,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     data,
+			},
+			&expr.Counter{},
+		},
+		UserData: []byte(ipStr + "/tx" + suffix),
+	})
+}
+
+// DiscoverIPv6Neighbors scans the kernel IPv6 neighbor table on the LAN and
+// WiFi interfaces and adds counter rules for any new global addresses. This
+// is how SLAAC and DHCPv6 clients are discovered, since clients pick their own
+// addresses.
+func (m *Monitor) DiscoverIPv6Neighbors() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	seen := make(map[string]bool)
+	for _, ifname := range append([]string{m.lanIface, m.wifiIface}, m.scanIfaces...) {
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			continue
+		}
+		neighs, err := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V6)
+		if err != nil {
+			log.Printf("status: ipv6 neighbor list on %s: %v", ifname, err)
+			continue
+		}
+		via := "L"
+		if ifname == m.wifiIface {
+			via = "W"
+		}
+		for _, n := range neighs {
+			if n.IP == nil || n.State&(netlink.NUD_NONE|netlink.NUD_INCOMPLETE|netlink.NUD_FAILED) != 0 {
+				continue
+			}
+			if n.IP.IsLinkLocalUnicast() || n.IP.IsLoopback() {
+				continue
+			}
+			ipStr := n.IP.String()
+			seen[ipStr] = true
+			m.ensureClient6Locked(n.IP, n.HardwareAddr.String(), via)
+		}
+	}
+	m.pruneStaleIPv6Locked(seen)
+}
+
+// ensureClient6Locked registers a discovered IPv6 neighbor and adds counter
+// rules for it. Caller must hold m.mu.
+func (m *Monitor) ensureClient6Locked(ip net.IP, mac, via string) {
+	ipStr := ip.String()
+	if m.gatewayIPs[ipStr] {
+		via = "G"
+	}
+	now := time.Now()
+
+	// Attach IPv6 to an existing connected client with the same MAC.
+	if mac != "" {
+		for key, entry := range m.clients {
+			if key == ipStr || !entry.Connected || entry.MAC != mac {
+				continue
+			}
+			entry.IP6 = ip.To16()
+			entry.LastSeen = now
+			m.clients[key] = entry
+			m.addCounterRulesLocked(ip, true)
+			return
+		}
+	}
+
+	if entry, ok := m.clients[ipStr]; ok {
+		if entry.Connected {
+			entry.LastSeen = now
+			m.clients[ipStr] = entry
+			return
+		}
+		entry.Connected = true
+		entry.IP6 = ip.To16()
+		entry.LastSeen = now
+		m.clients[ipStr] = entry
+	} else {
+		m.clients[ipStr] = clientEntry{
+			MAC:       mac,
+			IP6:       ip.To16(),
+			Via:       via,
+			Connected: true,
+			FirstSeen: now,
+			LastSeen:  now,
+		}
+	}
+	m.addCounterRulesLocked(ip, true)
+	log.Printf("status: tracking ipv6 %s (%s) via %s", ipStr, mac, via)
+}
+
+// pruneStaleIPv6Locked removes counter rules and entries for IPv6 neighbors
+// that have disappeared from the neighbor table. Caller must hold m.mu.
+func (m *Monitor) pruneStaleIPv6Locked(seen map[string]bool) {
+	const staleTimeout = 3 * time.Minute
+	now := time.Now()
+	changed := false
+	for key, entry := range m.clients {
+		if entry.IP6 == nil || !entry.Connected {
+			continue
+		}
+		ip6 := entry.IP6.String()
+		if seen[ip6] || now.Sub(entry.LastSeen) < staleTimeout {
+			continue
+		}
+		rxBytes, rxPkts := m.readAndDeleteRules(m.chainRx6, ip6+"/rx6")
+		txBytes, txPkts := m.readAndDeleteRules(m.chainTx6, ip6+"/tx6")
+		entry.HistRxBytes += rxBytes
+		entry.HistRxPkts += rxPkts
+		entry.HistTxBytes += txBytes
+		entry.HistTxPkts += txPkts
+		if entry.IP == nil {
+			delete(m.clients, key)
+		} else {
+			entry.IP6 = nil
+			entry.LastSeen = now
+			m.clients[key] = entry
+		}
+		changed = true
+		log.Printf("status: ipv6 neighbor %s gone, counters removed", ip6)
+	}
+	if changed {
+		m.conn.Flush()
+	}
+}
+
 // RemoveClient marks a client as disconnected. The current nftables counter
 // values are read and accumulated into the historical totals, then the
 // nftables rules are deleted so that a future reconnect starts fresh counters.
@@ -324,7 +510,7 @@ func (m *Monitor) RemoveClient(ip net.IP) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ipStr := ip.To4().String()
+	ipStr := ip.String()
 	entry, exists := m.clients[ipStr]
 	if !exists {
 		return nil // unknown client, nothing to do
@@ -342,7 +528,23 @@ func (m *Monitor) RemoveClient(ip net.IP) error {
 	entry.HistRxPkts += rxPkts
 	entry.HistTxBytes += txBytes
 	entry.HistTxPkts += txPkts
+
+	// If the client still has an active IPv6 session, keep the entry alive so
+	// IPv6 counters keep working; only the IPv4 session ends here.
+	if entry.IP6 != nil {
+		entry.IP = nil
+		entry.LastSeen = time.Now()
+		m.clients[ipStr] = entry
+		if err := m.conn.Flush(); err != nil {
+			return fmt.Errorf("status: flush after removing rules for %s: %w", ipStr, err)
+		}
+		log.Printf("status: client %s (%s) ipv4 disconnected, ipv6 session continues", ipStr, entry.MAC)
+		return nil
+	}
+
 	entry.Connected = false
+	entry.LastSeen = time.Now()
+	m.clients[ipStr] = entry
 	entry.LastSeen = time.Now()
 	m.clients[ipStr] = entry
 
@@ -359,26 +561,49 @@ func (m *Monitor) RemoveClient(ip net.IP) error {
 // This is useful for WiFi disconnect events where only the MAC is known.
 func (m *Monitor) RemoveClientByMAC(mac string) error {
 	m.mu.Lock()
-	var ip net.IP
+	var ip, ip6 net.IP
 	for _, entry := range m.clients {
 		if entry.MAC == mac && entry.Connected {
 			ip = entry.IP
+			ip6 = entry.IP6
 			break
 		}
 	}
 	m.mu.Unlock()
 
-	if ip == nil {
+	if ip == nil && ip6 == nil {
 		return nil // unknown MAC
 	}
-	return m.RemoveClient(ip)
+	if ip != nil {
+		return m.RemoveClient(ip)
+	}
+
+	// IPv6-only client: remove its v6 counters directly.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ipStr := ip6.String()
+	if entry, ok := m.clients[ipStr]; ok {
+		rxBytes, rxPkts := m.readAndDeleteRules(m.chainRx6, ipStr+"/rx6")
+		txBytes, txPkts := m.readAndDeleteRules(m.chainTx6, ipStr+"/tx6")
+		entry.HistRxBytes += rxBytes
+		entry.HistRxPkts += rxPkts
+		entry.HistTxBytes += txBytes
+		entry.HistTxPkts += txPkts
+		delete(m.clients, ipStr)
+		m.conn.Flush()
+	}
+	return nil
 }
 
 // readAndDeleteRules reads the counter values from nftables rules matching
 // the given userData tag, deletes them, and returns the total bytes and packets.
 // Must be called with m.mu held.
 func (m *Monitor) readAndDeleteRules(chain *nftables.Chain, tag string) (bytes, packets uint64) {
-	rules, err := m.conn.GetRules(m.table, chain)
+	table := m.table
+	if chain.Table != nil {
+		table = chain.Table
+	}
+	rules, err := m.conn.GetRules(table, chain)
 	if err != nil {
 		log.Printf("status: failed to get rules for chain %s: %v", chain.Name, err)
 		return 0, 0
@@ -410,6 +635,7 @@ func (m *Monitor) sampleLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			m.DiscoverIPv6Neighbors()
 			m.sample()
 			m.pollWiFiStations()
 		case <-m.stopCh:
@@ -428,6 +654,8 @@ func (m *Monitor) sample() {
 
 	rxRules, _ := m.conn.GetRules(m.table, m.chainRx)
 	txRules, _ := m.conn.GetRules(m.table, m.chainTx)
+	rxRules6, _ := m.conn.GetRules(m.table6, m.chainRx6)
+	txRules6, _ := m.conn.GetRules(m.table6, m.chainTx6)
 
 	// Build current snapshot.
 	current := make(map[string]counterSnapshot)
@@ -447,6 +675,34 @@ func (m *Monitor) sample() {
 	}
 	for _, r := range txRules {
 		ip := extractIP(r.UserData, "/tx")
+		if ip == "" {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				snap := current[ip]
+				snap.TxBytes = c.Bytes
+				snap.Time = now
+				current[ip] = snap
+			}
+		}
+	}
+	for _, r := range rxRules6 {
+		ip := extractIP(r.UserData, "/rx6")
+		if ip == "" {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				snap := current[ip]
+				snap.RxBytes = c.Bytes
+				snap.Time = now
+				current[ip] = snap
+			}
+		}
+	}
+	for _, r := range txRules6 {
+		ip := extractIP(r.UserData, "/tx6")
 		if ip == "" {
 			continue
 		}
@@ -520,6 +776,18 @@ func (m *Monitor) pollWiFiStations() {
 	m.mu.Lock()
 	m.wifiStations = info
 	m.mu.Unlock()
+}
+
+// AddScanInterfaces registers extra interfaces whose IPv6 neighbor tables
+// should be scanned for client addresses (e.g. per-VLAN bridges in VLAN mode).
+func (m *Monitor) AddScanInterfaces(names []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range names {
+		if n != "" {
+			m.scanIfaces = append(m.scanIfaces, n)
+		}
+	}
 }
 
 // SetWiFiSource sets the source for WiFi station info polling.
@@ -626,53 +894,54 @@ func (m *Monitor) GetStatus() (*Status, error) {
 
 	rxRules, _ := m.conn.GetRules(m.table, m.chainRx)
 	txRules, _ := m.conn.GetRules(m.table, m.chainTx)
+	rxRules6, _ := m.conn.GetRules(m.table6, m.chainRx6)
+	txRules6, _ := m.conn.GetRules(m.table6, m.chainTx6)
 
-	// Build maps: IP -> counter values
-	rxCounters := make(map[string][2]uint64) // [bytes, packets]
+	// Build maps: IP -> counter values [bytes, packets]
+	rxCounters := make(map[string][2]uint64)
 	txCounters := make(map[string][2]uint64)
+	forEachCounter(rxRules, "/rx", func(ip string, c *expr.Counter) {
+		rxCounters[ip] = [2]uint64{c.Bytes, c.Packets}
+	})
+	forEachCounter(txRules, "/tx", func(ip string, c *expr.Counter) {
+		txCounters[ip] = [2]uint64{c.Bytes, c.Packets}
+	})
+	forEachCounter(rxRules6, "/rx6", func(ip string, c *expr.Counter) {
+		rxCounters[ip] = [2]uint64{c.Bytes, c.Packets}
+	})
+	forEachCounter(txRules6, "/tx6", func(ip string, c *expr.Counter) {
+		txCounters[ip] = [2]uint64{c.Bytes, c.Packets}
+	})
 
-	for _, r := range rxRules {
-		ip := extractIP(r.UserData, "/rx")
-		if ip == "" {
-			continue
-		}
-		for _, e := range r.Exprs {
-			if c, ok := e.(*expr.Counter); ok {
-				rxCounters[ip] = [2]uint64{c.Bytes, c.Packets}
-			}
-		}
-	}
-	for _, r := range txRules {
-		ip := extractIP(r.UserData, "/tx")
-		if ip == "" {
-			continue
-		}
-		for _, e := range r.Exprs {
-			if c, ok := e.(*expr.Counter); ok {
-				txCounters[ip] = [2]uint64{c.Bytes, c.Packets}
-			}
-		}
-	}
-
-	for ipStr, entry := range m.clients {
+	for _, entry := range m.clients {
 		ci := ClientInfo{
-			IP:        ipStr,
 			MAC:       entry.MAC,
 			Via:       entry.Via,
 			Connected: entry.Connected,
 			FirstSeen: entry.FirstSeen.Format(time.RFC3339),
 			LastSeen:  entry.LastSeen.Format(time.RFC3339),
 		}
-
-		// Live counters from nftables (only present if connected).
-		var liveRxBytes, liveRxPkts, liveTxBytes, liveTxPkts uint64
-		if rx, ok := rxCounters[ipStr]; ok {
-			liveRxBytes = rx[0]
-			liveRxPkts = rx[1]
+		if entry.IP != nil {
+			ci.IP = entry.IP.String()
 		}
-		if tx, ok := txCounters[ipStr]; ok {
-			liveTxBytes = tx[0]
-			liveTxPkts = tx[1]
+		if entry.IP6 != nil {
+			ci.IP6 = entry.IP6.String()
+		}
+
+		// Live counters from nftables (v4 + v6, merged by address).
+		var liveRxBytes, liveRxPkts, liveTxBytes, liveTxPkts uint64
+		for _, ip := range []string{ci.IP, ci.IP6} {
+			if ip == "" {
+				continue
+			}
+			if rx, ok := rxCounters[ip]; ok {
+				liveRxBytes += rx[0]
+				liveRxPkts += rx[1]
+			}
+			if tx, ok := txCounters[ip]; ok {
+				liveTxBytes += tx[0]
+				liveTxPkts += tx[1]
+			}
 		}
 
 		ci.RxBytes = liveRxBytes
@@ -681,9 +950,11 @@ func (m *Monitor) GetStatus() (*Status, error) {
 		ci.TxPkts = liveTxPkts
 
 		// Throughput from background sampler.
-		if rate, ok := m.rates[ipStr]; ok {
-			ci.RxRate = rate.RxRate
-			ci.TxRate = rate.TxRate
+		for _, ip := range []string{ci.IP, ci.IP6} {
+			if rate, ok := m.rates[ip]; ok {
+				ci.RxRate += rate.RxRate
+				ci.TxRate += rate.TxRate
+			}
 		}
 
 		// WiFi link info from hostapd control socket (matched by MAC).
@@ -705,6 +976,22 @@ func (m *Monitor) GetStatus() (*Status, error) {
 	}
 
 	return s, nil
+}
+
+// forEachCounter iterates the Counter expressions in rules whose UserData
+// matches the given suffix, calling fn with the extracted IP and counter.
+func forEachCounter(rules []*nftables.Rule, suffix string, fn func(ip string, c *expr.Counter)) {
+	for _, r := range rules {
+		ip := extractIP(r.UserData, suffix)
+		if ip == "" {
+			continue
+		}
+		for _, e := range r.Exprs {
+			if c, ok := e.(*expr.Counter); ok {
+				fn(ip, c)
+			}
+		}
+	}
 }
 
 func extractIP(userData []byte, suffix string) string {

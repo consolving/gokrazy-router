@@ -23,6 +23,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
 	"github.com/consolving/gokrazy-router/pkg/pxe"
+	"github.com/consolving/gokrazy-router/pkg/ra"
 	"github.com/consolving/gokrazy-router/pkg/smb"
 	"github.com/consolving/gokrazy-router/pkg/status"
 	"github.com/consolving/gokrazy-router/pkg/vlan"
@@ -67,6 +68,21 @@ func main() {
 		}
 		if len(cfg.WiFi.DHCP.DNS) == 0 {
 			cfg.WiFi.DHCP.DNS = append([]string(nil), cfg.DNS...)
+		}
+	}
+
+	// Apply global IPv6 DNS default to all RA/DHCPv6 scopes that don't have one.
+	if len(cfg.DNS6) > 0 {
+		if len(cfg.LAN.DNS6) == 0 {
+			cfg.LAN.DNS6 = append([]string(nil), cfg.DNS6...)
+		}
+		for i := range cfg.VLANs {
+			if len(cfg.VLANs[i].DNS6) == 0 {
+				cfg.VLANs[i].DNS6 = append([]string(nil), cfg.DNS6...)
+			}
+		}
+		if len(cfg.WiFi.DNS6) == 0 {
+			cfg.WiFi.DNS6 = append([]string(nil), cfg.DNS6...)
 		}
 	}
 
@@ -120,7 +136,7 @@ func main() {
 		}
 		_ = vlanBridges
 	} else {
-		_, err = netsetup.Setup(cfg.LAN.Bridge, cfg.LAN.Interfaces, cfg.LAN.Address)
+		_, err = netsetup.Setup(cfg.LAN.Bridge, cfg.LAN.Interfaces, cfg.LAN.Address, cfg.LAN.Address6)
 		if err != nil {
 			log.Fatalf("netsetup: %v", err)
 		}
@@ -129,6 +145,47 @@ func main() {
 	// 2. Enable IP forwarding.
 	if err := netsetup.EnableForwarding(); err != nil {
 		log.Fatalf("forwarding: %v", err)
+	}
+
+	// 2b. IPv6 WAN configuration and forwarding.
+	ipv6Enabled := cfg.LAN.Address6 != "" || cfg.WiFi.Address6 != ""
+	for _, vc := range cfg.VLANs {
+		if vc.Address6 != "" {
+			ipv6Enabled = true
+		}
+	}
+	if ipv6Enabled {
+		if err := netsetup.EnableIPv6Forwarding(); err != nil {
+			log.Fatalf("forwarding6: %v", err)
+		}
+	}
+	switch cfg.WAN.Mode6 {
+	case "static":
+		if cfg.WAN.Address6 == "" {
+			log.Printf("wan: mode6=static but no address6 configured, skipping IPv6 WAN setup")
+		} else {
+			if err := assignIP(cfg.NAT.OutInterface, cfg.WAN.Address6); err != nil {
+				log.Fatalf("wan: assign IPv6 address: %v", err)
+			}
+			if cfg.WAN.Gateway6 != "" {
+				gw := net.ParseIP(cfg.WAN.Gateway6)
+				if gw == nil {
+					log.Printf("wan: invalid gateway6 %q", cfg.WAN.Gateway6)
+				} else if err := addDefaultRoute6(cfg.NAT.OutInterface, gw); err != nil {
+					log.Fatalf("wan: add IPv6 default route: %v", err)
+				}
+			}
+			log.Printf("wan: %s configured with %s (static IPv6)", cfg.NAT.OutInterface, cfg.WAN.Address6)
+		}
+	case "auto":
+		if err := netsetup.EnableSLAAC(cfg.NAT.OutInterface); err != nil {
+			log.Fatalf("wan: enable SLAAC: %v", err)
+		}
+		log.Printf("wan: %s in IPv6 SLAAC mode", cfg.NAT.OutInterface)
+	case "disabled":
+		if err := netsetup.DisableIPv6(cfg.NAT.OutInterface); err != nil {
+			log.Printf("wan: disable IPv6: %v", err)
+		}
 	}
 
 	// 3. Install NAT masquerade rules.
@@ -168,6 +225,42 @@ func main() {
 		}
 	}
 
+	// 3a. Install NAT66 masquerade rules for IPv6 (ULA/non-routed prefixes).
+	var natMgr6 *nat.Manager
+	if cfg.NAT.Enabled6 {
+		if vlanMode {
+			for _, vc := range cfg.VLANs {
+				if !vc.NAT || vc.Address6 == "" {
+					continue
+				}
+				_, vNet6, err := net.ParseCIDR(vc.Address6)
+				if vNet6 == nil {
+					continue
+				}
+				if natMgr6 == nil {
+					natMgr6, err = nat.Setup6(cfg.NAT.OutInterface, vNet6)
+					if err != nil {
+						log.Fatalf("nat6: %v", err)
+					}
+				} else {
+					if err := natMgr6.AddSource6(vNet6); err != nil {
+						log.Fatalf("nat6: add VLAN %d source: %v", vc.ID, err)
+					}
+				}
+			}
+		} else {
+			_, srcNet6, err := net.ParseCIDR(cfg.LAN.Address6)
+			if err != nil {
+				log.Printf("nat6: parse LAN CIDR6 %q: %v (NAT66 disabled)", cfg.LAN.Address6, err)
+			} else {
+				natMgr6, err = nat.Setup6(cfg.NAT.OutInterface, srcNet6)
+				if err != nil {
+					log.Fatalf("nat6: %v", err)
+				}
+			}
+		}
+	}
+
 	// 3b. Install inter-VLAN isolation rules for isolated VLANs.
 	if vlanMode && natMgr != nil {
 		var allBridges []string
@@ -194,6 +287,75 @@ func main() {
 		}
 	}
 
+	// 3c. IPv6 isolation rules, mirroring the IPv4 setup.
+	if vlanMode && natMgr6 != nil {
+		var allBridges6 []string
+		for _, vc := range cfg.VLANs {
+			allBridges6 = append(allBridges6, vlan.BridgeName(vc.ID))
+		}
+		for _, vc := range cfg.VLANs {
+			if !vc.Isolated {
+				continue
+			}
+			isolated := vlan.BridgeName(vc.ID)
+			var others []string
+			for _, b := range allBridges6 {
+				if b != isolated {
+					others = append(others, b)
+				}
+			}
+			if len(others) > 0 {
+				if err := natMgr6.AddIsolation6(isolated, others); err != nil {
+					log.Fatalf("nat6: isolation for VLAN %d: %v", vc.ID, err)
+				}
+			}
+		}
+	}
+
+	// 3d. Start IPv6 client addressing (RA + DHCPv6) for LAN/VLAN scopes.
+	var activeServices []string
+
+	startIPv6Scope := func(iface, addr6 string, sendRA, runDHCP6 bool, dns6 []string) {
+		if addr6 == "" {
+			return
+		}
+		if sendRA {
+			srv, err := ra.New(ra.Config{Interface: iface, Address6: addr6, DNS6: dns6, Managed: runDHCP6, Other: runDHCP6})
+			if err != nil {
+				log.Printf("ra: %s: %v", iface, err)
+			} else if err := srv.Start(); err != nil {
+				log.Printf("ra: %s: %v", iface, err)
+			} else {
+				activeServices = append(activeServices, fmt.Sprintf("RA(%s)", iface))
+			}
+		}
+		if runDHCP6 {
+			srv, err := ra.NewDHCP6Server(iface, addr6, dns6)
+			if err != nil {
+				log.Printf("dhcp6: %s: %v", iface, err)
+			} else {
+				if cfg.Services.PXE.Enabled {
+					if ip, _, err := net.ParseCIDR(addr6); err == nil {
+						srv.SetPXEBootFile6(ip, cfg.Services.PXE.LegacyBootFile, cfg.Services.PXE.UEFIBootFile)
+					}
+				}
+				if err := srv.Start(); err != nil {
+					log.Printf("dhcp6: %s: %v", iface, err)
+				} else {
+					activeServices = append(activeServices, fmt.Sprintf("DHCP6(%s)", iface))
+				}
+			}
+		}
+	}
+
+	if vlanMode {
+		for _, vc := range cfg.VLANs {
+			startIPv6Scope(vlan.BridgeName(vc.ID), vc.Address6, vc.RA, vc.DHCP6, vc.DNS6)
+		}
+	} else {
+		startIPv6Scope(cfg.LAN.Bridge, cfg.LAN.Address6, cfg.LAN.RA, cfg.LAN.DHCP6, cfg.LAN.DNS6)
+	}
+
 	// 4. Start status monitor (nftables per-client counters).
 	wifiIface := cfg.WiFi.Interface
 	if wifiIface == "" {
@@ -202,12 +364,16 @@ func main() {
 	mon, err := status.New(cfg.NAT.OutInterface, cfg.LAN.Bridge, cfg.LAN.Interfaces, wifiIface)
 	if err != nil {
 		log.Printf("status monitor: %v (continuing without)", err)
+	} else if vlanMode {
+		var scanIfaces []string
+		for _, vc := range cfg.VLANs {
+			scanIfaces = append(scanIfaces, vlan.BridgeName(vc.ID))
+		}
+		mon.AddScanInterfaces(scanIfaces)
 	}
 
 	// Collect running services for config reload.
 	var dhcpEntries []dhcpEntry
-
-	var activeServices []string
 
 	// 5. Start WiFi AP (hostapd).
 	var wifiAP *wifi.AP
@@ -253,19 +419,36 @@ func main() {
 			if mon != nil {
 				mon.SetWiFiSource(&wifiStationAdapter{ap: ap})
 			}
-			if cfg.WiFi.Address != "" && wifiAP.MacMap() == nil {
-				if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
-					log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
+			if wifiAP.MacMap() == nil {
+				if cfg.WiFi.Address != "" {
+					if err := assignIP(wifiIface, cfg.WiFi.Address); err != nil {
+						log.Fatalf("wifi: assign IP to %s: %v", wifiIface, err)
+					}
+					log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
+					if natMgr != nil {
+						_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
+						if err != nil {
+							log.Fatalf("parse WiFi CIDR: %v", err)
+						}
+						if err := natMgr.AddSource(wifiNet); err != nil {
+							log.Fatalf("nat: add WiFi source: %v", err)
+						}
+					}
 				}
-				log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address)
-				if natMgr != nil {
-					_, wifiNet, err := net.ParseCIDR(cfg.WiFi.Address)
-					if err != nil {
-						log.Fatalf("parse WiFi CIDR: %v", err)
+				if cfg.WiFi.Address6 != "" {
+					if err := assignIP(wifiIface, cfg.WiFi.Address6); err != nil {
+						log.Fatalf("wifi: assign IPv6 address to %s: %v", wifiIface, err)
 					}
-					if err := natMgr.AddSource(wifiNet); err != nil {
-						log.Fatalf("nat: add WiFi source: %v", err)
+					log.Printf("wifi: %s configured with %s (routed mode)", wifiIface, cfg.WiFi.Address6)
+					if natMgr6 != nil {
+						_, wifiNet6, err := net.ParseCIDR(cfg.WiFi.Address6)
+						if err == nil {
+							if err := natMgr6.AddSource6(wifiNet6); err != nil {
+								log.Fatalf("nat6: add WiFi source: %v", err)
+							}
+						}
 					}
+					startIPv6Scope(wifiIface, cfg.WiFi.Address6, cfg.WiFi.RA, cfg.WiFi.DHCP6, cfg.WiFi.DNS6)
 				}
 			}
 		}
@@ -589,6 +772,20 @@ func (r *reloader) checkRestartRequired(extras *config.ExtrasConfig) error {
 			break
 		}
 	}
+	// IPv6 VLAN address overrides change bridge, DHCPv6 and NAT66 state, so a
+	// change requires a restart just like the IPv4 case.
+	for id, addr := range extras.VLANAddresses6 {
+		for i := range r.cfg.VLANs {
+			if r.cfg.VLANs[i].ID != id {
+				continue
+			}
+			if addr != r.cfg.VLANs[i].Address6 {
+				return &restartRequiredError{msg: fmt.Sprintf(
+					"vlanAddresses6[%d] changed from %s to %s: VLAN address changes require a router restart", r.cfg.VLANs[i].ID, r.cfg.VLANs[i].Address6, addr)}
+			}
+			break
+		}
+	}
 	// SMB user-list changes cannot be applied at runtime: valid users and the
 	// password database are baked into smb.conf when smbd starts.
 	if !equalSMBUsers(r.appliedSMBUsers, extras.SMBUsers) {
@@ -759,6 +956,26 @@ func assignIP(ifaceName, cidr string) error {
 		}
 	}
 	return netlink.LinkSetUp(link)
+}
+
+// addDefaultRoute6 installs a default IPv6 route via the given gateway.
+func addDefaultRoute6(ifaceName string, gw net.IP) error {
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return err
+	}
+	route := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		Gw:        gw,
+	}
+	if err := netlink.RouteAdd(route); err != nil {
+		if errors.Is(err, syscall.EEXIST) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // enableProxyARP enables proxy ARP on the named interface via sysctl.

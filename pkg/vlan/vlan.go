@@ -53,10 +53,17 @@ func Setup(vlans []config.VLANConfig) ([]VLANBridge, error) {
 func setupOne(vc config.VLANConfig) (*VLANBridge, error) {
 	bridgeName := fmt.Sprintf("br-vlan%d", vc.ID)
 
-	// Parse address.
+	// Parse addresses.
 	ipNet, err := netlink.ParseAddr(vc.Address)
 	if err != nil {
 		return nil, fmt.Errorf("parse address %q: %w", vc.Address, err)
+	}
+	var ip6Net *netlink.Addr
+	if vc.Address6 != "" {
+		ip6Net, err = netlink.ParseAddr(vc.Address6)
+		if err != nil {
+			return nil, fmt.Errorf("parse address6 %q: %w", vc.Address6, err)
+		}
 	}
 
 	// Create bridge. Each VLAN gets its own bridge with dedicated ports,
@@ -96,9 +103,16 @@ func setupOne(vc config.VLANConfig) (*VLANBridge, error) {
 		log.Printf("vlan: port %s -> %s (vlan %d)", portName, bridgeName, vc.ID)
 	}
 
-	// Assign IP address.
+	// Assign IPv4 address.
 	if err := netlink.AddrAdd(brLink, ipNet); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("assign %s to %s: %w", vc.Address, bridgeName, err)
+	}
+
+	// Assign optional IPv6 address.
+	if ip6Net != nil {
+		if err := netlink.AddrAdd(brLink, ip6Net); err != nil && !os.IsExist(err) {
+			return nil, fmt.Errorf("assign %s to %s: %w", vc.Address6, bridgeName, err)
+		}
 	}
 
 	// Bring up the bridge.
@@ -108,7 +122,7 @@ func setupOne(vc config.VLANConfig) (*VLANBridge, error) {
 
 	_, subnet, _ := net.ParseCIDR(vc.Address)
 
-	log.Printf("vlan: %s (vlan %d) up with %s, ports: %v", bridgeName, vc.ID, vc.Address, vc.Ports)
+	log.Printf("vlan: %s (vlan %d) up with %s%s, ports: %v", bridgeName, vc.ID, vc.Address, optAddr6Log(vc.Address6), vc.Ports)
 
 	return &VLANBridge{
 		ID:     vc.ID,
@@ -116,6 +130,13 @@ func setupOne(vc config.VLANConfig) (*VLANBridge, error) {
 		Bridge: brLink,
 		Subnet: subnet,
 	}, nil
+}
+
+func optAddr6Log(addr6 string) string {
+	if addr6 == "" {
+		return ""
+	}
+	return " and " + addr6
 }
 
 // AddInterface adds an interface (e.g. a hostapd-created wlan0.10) to the

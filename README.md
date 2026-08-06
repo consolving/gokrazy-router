@@ -7,6 +7,7 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **VLAN support** — Per-port network isolation using separate bridges (one bridge per VLAN)
 - **DHCP server** — Per-VLAN DHCP servers, each with its own address range
 - **NAT/masquerade** — nftables-based masquerade for outbound traffic via `wan`
+- **IPv6 (SLAAC/DHCPv6/NAT66)** — Per-scope Router Advertisements (SLAAC), stateful/stateless DHCPv6, IPv6 forwarding, NAT66 masquerade and dual-stack per-client traffic counters
 - **Inter-VLAN isolation** — VLANs marked `isolated` are firewalled from all other VLANs (internet-only)
 - **WiFi access point** — Runs the onboard RTL8192CU as an AP via a bundled `hostapd` binary, with automatic restart on crash (exponential backoff)
 - **WiFi + LAN shared subnet** — WiFi and a LAN port can share a subnet (split into two /25 ranges), with the router forwarding between them
@@ -145,6 +146,53 @@ When the `vlans` array is empty or omitted, all LAN ports are bridged into a sin
 
 - **Routed** (default): `wlan0` gets its own subnet. A separate DHCP server runs on `wlan0`. The RTL8192CU does not support bridged AP mode (data frames are not forwarded), so routed mode is required.
 - **Shared subnet with LAN**: Split a /24 into two /25 subnets — one for WiFi, one for a LAN port. The router forwards between them. See VLAN 31 in the example above.
+
+### IPv6
+
+IPv6 support is optional and opt-in per scope. The router acts as an IPv6 gateway on every interface that has an `address6` set: it assigns itself the address, enables IPv6 forwarding, and — when `ra` is enabled — sends Router Advertisements (SLAAC) so clients autoconfigure. A built-in RA server is used (no external `radvd`), so no extra binaries are needed on gokrazy.
+
+Key settings:
+
+| Field | Scope | Purpose |
+|-------|-------|---------|
+| `address6` | `wan`, `lan`, `vlans[]`, `wifi` | Router IPv6 address on the interface, CIDR (e.g. `fd00::1/64`). When set on a LAN scope it also defines the prefix advertised to clients |
+| `ra` | `lan`, `vlans[]`, `wifi` | Send Router Advertisements (SLAAC). `true` required for any client autoconfiguration |
+| `dhcp6` | `lan`, `vlans[]`, `wifi` | Run a DHCPv6 server on the scope (stateful IA_NA assignment + stateless DNS). Sets the RA M/O flags so clients use it |
+| `dns6` | global, `lan`, `vlans[]`, `wifi` | IPv6 DNS servers. Announced via RDNSS in RAs and DHCPv6 option 23. Per-scope value falls back to the global `dns6` |
+| `mode6` | `wan` | `auto` (SLAAC, accept RAs from upstream — default), `static` (uses `address6` + `gateway6`), `disabled` (IPv6 off on WAN) |
+| `enabled6` | `nat` | NAT66 masquerade for non-routed prefixes (e.g. ULA). When off, global-prefix IPv6 is routed as-is (clients must have upstream global addresses) |
+
+Example flat-mode IPv6:
+
+```json
+{
+  "lan": {
+    "address": "10.0.0.1/24",
+    "address6": "fd00::1/64",
+    "ra": true,
+    "dhcp6": true,
+    "dns6": ["2606:4700:4700::1111", "2001:4860:4860::8888"]
+  },
+  "nat": {"enabled": true, "enabled6": true, "outInterface": "wan"},
+  "wan": {"interface": "wan", "mode": "dhcp", "mode6": "auto"}
+}
+```
+
+Client addressing model:
+
+- **SLAAC only** — `address6` + `ra: true`. Clients pick addresses from the prefix (e.g. `fd00::/64`). The RA includes the prefix and the RDNSS option (from `dns6`).
+- **Stateful DHCPv6** — add `dhcp6: true`. The RA sets the Managed (M) flag and clients request IA_NA leases; the DHCPv6 server hands out the first free addresses after the router's own. The server also answers Information Requests, so stateless-only clients still get DNS.
+- **Stateless DHCPv6** — RA with the M flag off and `dhcp6: true`: clients keep SLAAC addresses but pull DNS from DHCPv6 option 23.
+
+The WAN can be set up three ways:
+
+- `mode6: "auto"` (default) — the WAN interface accepts Router Advertisements from the ISP (`accept_ra=2`), which is required because IPv6 forwarding is on. Clients behind NAT66 get global addresses from the router's own IPv6.
+- `mode6: "static"` — the router uses `address6` and installs a default route via `gateway6`.
+- `mode6: "disabled"` — IPv6 is turned off on the WAN interface.
+
+Per-client traffic counters are dual-stack: SLAAC/DHCPv6 client addresses are discovered from the kernel neighbor table and counted alongside IPv4 in the status API (`ip6` field on each client entry). Clients are matched by MAC, so a dual-stack device appears as one entry with both `ip` and `ip6`.
+
+For the example VLAN topology above, each VLAN would add `address6` (e.g. `fd00:1::1/64`), `ra: true` and optionally `dhcp6: true`; the WiFi routed subnet gets its own `address6` on `wlan0`.
 
 ## Optional services
 
@@ -304,6 +352,8 @@ Supported keys:
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE (option 77) |
 | `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes). Applying changes requires a router restart — `/api/reload` rejects them with HTTP 409 |
+| `[vlanAddresses6]` | `id = "cidr"` IPv6 address override per VLAN. Changes require a router restart — `/api/reload` rejects them with HTTP 409 |
+| `[dns6]` | Global IPv6 DNS override applied to every RA/DHCPv6 scope (LAN, VLANs, WiFi) |
 | `[[smbUsers]]` | Extra SMB users: `name`, `password`. Granted access at startup; adding/removing users requires a router restart — `/api/reload` rejects the change with HTTP 409 |
 
 The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. This is deliberate: once a client runs iPXE, its `ipxeScript` must win over the MAC mapping or the client would never leave the initial boot loader. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
@@ -469,9 +519,10 @@ The columns show:
 
 | Library | Purpose |
 |---------|---------|
-| `github.com/vishvananda/netlink` | Bridge, interface, address management |
-| `github.com/google/nftables` | NAT masquerade + isolation rules + traffic counters |
-| `github.com/insomniacslk/dhcp` | DHCPv4 server |
+| `github.com/vishvananda/netlink` | Bridge, interface, address, neighbor and route management |
+| `github.com/google/nftables` | NAT/NAT66 masquerade + isolation rules + traffic counters |
+| `github.com/insomniacslk/dhcp` | DHCPv4 + DHCPv6 servers |
+| `github.com/mdlayher/ndp` | Router Advertisement (SLAAC) server |
 | `github.com/pelletier/go-toml/v2` | MAC-to-VLAN mapping and runtime extras config parsing |
 
 External: `hostapd` and optionally `smbd`/`smbpasswd` (statically compiled, bundled via gokrazy ExtraFilePaths)

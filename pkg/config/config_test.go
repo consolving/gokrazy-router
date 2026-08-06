@@ -418,3 +418,123 @@ func TestNormalizeMAC(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadIPv6Config(t *testing.T) {
+	json := `{
+		"wan": {"mode6": "static", "address6": "2001:db8::2/64", "gateway6": "2001:db8::1"},
+		"lan": {
+			"address6": "fd00::1/64",
+			"ra": true,
+			"dhcp6": true,
+			"dns6": ["2001:db8::53"]
+		},
+		"nat": {"enabled6": true},
+		"dns6": ["2606:4700:4700::1111"]
+	}`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(json), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.WAN.Mode6 != "static" {
+		t.Errorf("WAN.Mode6 = %q, want static", cfg.WAN.Mode6)
+	}
+	if cfg.WAN.Address6 != "2001:db8::2/64" {
+		t.Errorf("WAN.Address6 = %q", cfg.WAN.Address6)
+	}
+	if cfg.WAN.Gateway6 != "2001:db8::1" {
+		t.Errorf("WAN.Gateway6 = %q", cfg.WAN.Gateway6)
+	}
+	if cfg.LAN.Address6 != "fd00::1/64" {
+		t.Errorf("LAN.Address6 = %q", cfg.LAN.Address6)
+	}
+	if !cfg.LAN.RA {
+		t.Error("LAN.RA = false, want true")
+	}
+	if !cfg.LAN.DHCP6 {
+		t.Error("LAN.DHCP6 = false, want true")
+	}
+	if len(cfg.LAN.DNS6) != 1 || cfg.LAN.DNS6[0] != "2001:db8::53" {
+		t.Errorf("LAN.DNS6 = %v", cfg.LAN.DNS6)
+	}
+	if !cfg.NAT.Enabled6 {
+		t.Error("NAT.Enabled6 = false, want true")
+	}
+	if len(cfg.DNS6) != 1 || cfg.DNS6[0] != "2606:4700:4700::1111" {
+		t.Errorf("DNS6 = %v", cfg.DNS6)
+	}
+}
+
+func TestApplyExtrasVLANAddresses6(t *testing.T) {
+	cfg := Default()
+	cfg.VLANs = []VLANConfig{
+		{ID: 1, Name: "main", Address: "10.0.0.1/24"},
+		{ID: 2, Name: "guest", Address: "10.0.1.1/24"},
+	}
+
+	extras := &ExtrasConfig{
+		VLANAddresses:  map[int]string{2: "10.0.9.1/24"},
+		VLANAddresses6: map[int]string{1: "fd00::1/64"},
+		DNS6:           []string{"2001:db8::53"},
+	}
+	cfg.ApplyExtras(extras)
+
+	if cfg.VLANs[1].Address != "10.0.9.1/24" {
+		t.Errorf("VLAN2 Address = %q, want 10.0.9.1/24", cfg.VLANs[1].Address)
+	}
+	if cfg.VLANs[0].Address6 != "fd00::1/64" {
+		t.Errorf("VLAN1 Address6 = %q, want fd00::1/64", cfg.VLANs[0].Address6)
+	}
+	for _, v := range cfg.VLANs {
+		if len(v.DNS6) != 1 || v.DNS6[0] != "2001:db8::53" {
+			t.Errorf("VLAN %d DNS6 = %v", v.ID, v.DNS6)
+		}
+	}
+	if len(cfg.WiFi.DNS6) != 1 || cfg.WiFi.DNS6[0] != "2001:db8::53" {
+		t.Errorf("WiFi DNS6 = %v", cfg.WiFi.DNS6)
+	}
+}
+
+func TestExtrasFromConfigVLANAddresses6(t *testing.T) {
+	cfg := Default()
+	cfg.VLANs = []VLANConfig{{ID: 1, Name: "main", Address6: "fd00::1/64"}}
+
+	e := ExtrasFromConfig(cfg)
+	if e.VLANAddresses6[1] != "fd00::1/64" {
+		t.Errorf("ExtrasFromConfig VLANAddresses6 = %v", e.VLANAddresses6)
+	}
+	if e.VLANAddresses[1] != cfg.VLANs[0].Address {
+		t.Errorf("ExtrasFromConfig VLANAddresses = %v", e.VLANAddresses)
+	}
+}
+
+func TestExtrasSaveLoadIPv6(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "extras.toml")
+
+	orig := &ExtrasConfig{
+		VLANAddresses6: map[int]string{1: "fd00::1/64"},
+		DNS6:           []string{"2001:db8::53"},
+	}
+	if err := orig.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := LoadExtras(path)
+	if err != nil {
+		t.Fatalf("LoadExtras: %v", err)
+	}
+	if loaded.VLANAddresses6[1] != "fd00::1/64" {
+		t.Errorf("VLANAddresses6 mismatch: %v", loaded.VLANAddresses6)
+	}
+	if len(loaded.DNS6) != 1 || loaded.DNS6[0] != "2001:db8::53" {
+		t.Errorf("DNS6 mismatch: %v", loaded.DNS6)
+	}
+}

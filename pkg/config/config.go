@@ -21,12 +21,17 @@ type Config struct {
 	NAT      NATConfig      `json:"nat"`
 	WiFi     WiFiConfig     `json:"wifi,omitempty"`
 	Services ServicesConfig `json:"services,omitempty"`
-	DNS      []string       `json:"dns,omitempty"` // default DNS for all DHCP scopes
+	DNS      []string       `json:"dns,omitempty"`  // default DNS for all DHCP scopes
+	DNS6     []string       `json:"dns6,omitempty"` // default IPv6 DNS for all RA/DHCPv6 scopes
 }
 
 type WANConfig struct {
 	Interface string `json:"interface"`
 	Mode      string `json:"mode"` // "dhcp" or "static"
+	// IPv6 configuration for the WAN interface.
+	Address6 string `json:"address6,omitempty"` // static IPv6 address (CIDR)
+	Gateway6 string `json:"gateway6,omitempty"` // static IPv6 default gateway
+	Mode6    string `json:"mode6,omitempty"`    // "auto" (SLAAC, default), "static", "disabled"
 }
 
 type LANConfig struct {
@@ -34,6 +39,12 @@ type LANConfig struct {
 	Interfaces []string   `json:"interfaces"`
 	Address    string     `json:"address"`
 	DHCP       DHCPConfig `json:"dhcp"`
+	// IPv6: router address on the bridge (CIDR). When set, IPv6 forwarding is
+	// enabled and the interface participates in IPv6 routing.
+	Address6 string   `json:"address6,omitempty"`
+	RA       bool     `json:"ra,omitempty"`    // send Router Advertisements (SLAAC)
+	DHCP6    bool     `json:"dhcp6,omitempty"` // run a DHCPv6 server (stateful + stateless)
+	DNS6     []string `json:"dns6,omitempty"`  // IPv6 recursive DNS servers (RDNSS + DHCPv6 option 23)
 }
 
 type DHCPConfig struct {
@@ -55,10 +66,16 @@ type VLANConfig struct {
 	DHCP     DHCPConfig `json:"dhcp"`
 	NAT      bool       `json:"nat"`
 	Isolated bool       `json:"isolated,omitempty"` // if true, block inter-VLAN traffic (internet-only)
+	// IPv6: router address on this VLAN's bridge (CIDR).
+	Address6 string   `json:"address6,omitempty"`
+	RA       bool     `json:"ra,omitempty"`    // send Router Advertisements (SLAAC)
+	DHCP6    bool     `json:"dhcp6,omitempty"` // run a DHCPv6 server on this VLAN
+	DNS6     []string `json:"dns6,omitempty"`  // IPv6 recursive DNS servers
 }
 
 type NATConfig struct {
 	Enabled      bool   `json:"enabled"`
+	Enabled6     bool   `json:"enabled6,omitempty"` // NAT66 masquerade for IPv6 (ULA/non-routed prefixes)
 	OutInterface string `json:"outInterface"`
 }
 
@@ -77,6 +94,11 @@ type WiFiConfig struct {
 	HTCapab     string     `json:"htCapab"` // e.g. "[HT40+][SHORT-GI-20]"
 	CountryCode string     `json:"countryCode"`
 	WPA         int        `json:"wpa"` // 2 for WPA2
+	// IPv6: router address on wlan0 (routed mode) or the bridge subnet.
+	Address6 string   `json:"address6,omitempty"`
+	RA       bool     `json:"ra,omitempty"`    // send Router Advertisements (SLAAC)
+	DHCP6    bool     `json:"dhcp6,omitempty"` // run a DHCPv6 server on the WiFi subnet
+	DNS6     []string `json:"dns6,omitempty"`  // IPv6 recursive DNS servers
 }
 
 // ServicesConfig groups optional add-on services that are not part of the core router.
@@ -139,16 +161,18 @@ type PXEConfig struct {
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations   map[string]string `toml:"reservations"`              // MAC -> IP
-	MacImages      map[string]string `toml:"macImages"`                 // MAC -> PXE image filename
-	DefaultImage   string            `toml:"defaultImage"`              // PXE default image (overrides router.json)
-	PXEBootFile    string            `toml:"pxeBootFile"`               // DHCP option 67 bootfile (applied to all subnets)
-	LegacyBootFile string            `toml:"legacyBootFile,omitempty"`  // option 67 for legacy BIOS PXE clients
-	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`    // option 67 for UEFI PXE clients
-	IPXEScript     string            `toml:"ipxeScript,omitempty"`      // option 67 once iPXE identifies itself
-	SMBUsers       []SMBUser         `toml:"smbUsers"`                  // additional SMB users
-	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`   // VLAN ID -> CIDR address override
-	DNS            []string          `toml:"dns,omitempty"`             // default DNS for all DHCP scopes
+	Reservations   map[string]string `toml:"reservations"`             // MAC -> IP
+	MacImages      map[string]string `toml:"macImages"`                // MAC -> PXE image filename
+	DefaultImage   string            `toml:"defaultImage"`             // PXE default image (overrides router.json)
+	PXEBootFile    string            `toml:"pxeBootFile"`              // DHCP option 67 bootfile (applied to all subnets)
+	LegacyBootFile string            `toml:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
+	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
+	IPXEScript     string            `toml:"ipxeScript,omitempty"`     // option 67 once iPXE identifies itself
+	SMBUsers       []SMBUser         `toml:"smbUsers"`                 // additional SMB users
+	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`  // VLAN ID -> CIDR address override
+	VLANAddresses6 map[int]string    `toml:"vlanAddresses6,omitempty"` // VLAN ID -> IPv6 CIDR address override
+	DNS            []string          `toml:"dns,omitempty"`            // default DNS for all DHCP scopes
+	DNS6           []string          `toml:"dns6,omitempty"`           // default IPv6 DNS for all RA/DHCPv6 scopes
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -348,6 +372,14 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 			}
 		}
 	}
+	for id, addr := range extras.VLANAddresses6 {
+		for i := range c.VLANs {
+			if c.VLANs[i].ID == id {
+				c.VLANs[i].Address6 = addr
+				break
+			}
+		}
+	}
 	// DNS overrides are applied to all scopes: extras is the runtime source
 	// of truth, so removing an entry from the file will revert the scope back
 	// to whatever the base JSON had (or the global config.DNS default).
@@ -357,6 +389,13 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 		}
 		c.WiFi.DHCP.DNS = extras.DNS
 		c.LAN.DHCP.DNS = extras.DNS
+	}
+	if len(extras.DNS6) > 0 {
+		for i := range c.VLANs {
+			c.VLANs[i].DNS6 = extras.DNS6
+		}
+		c.WiFi.DNS6 = extras.DNS6
+		c.LAN.DNS6 = extras.DNS6
 	}
 }
 
@@ -389,6 +428,10 @@ func ExtrasFromConfig(c *Config) *ExtrasConfig {
 	e.VLANAddresses = make(map[int]string)
 	for _, v := range c.VLANs {
 		e.VLANAddresses[v.ID] = v.Address
+	}
+	e.VLANAddresses6 = make(map[int]string)
+	for _, v := range c.VLANs {
+		e.VLANAddresses6[v.ID] = v.Address6
 	}
 	return e
 }
