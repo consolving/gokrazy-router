@@ -3,6 +3,7 @@
 package ra
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mdlayher/ndp"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -69,6 +72,9 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("ra: interface %s: %w", s.cfg.Interface, err)
 	}
+	if err := ensureLinkLocal(ifi); err != nil {
+		return fmt.Errorf("ra: %s: %w", s.cfg.Interface, err)
+	}
 	conn, src, err := ndp.Listen(ifi, ndp.LinkLocal)
 	if err != nil {
 		return fmt.Errorf("ra: listen on %s: %w", s.cfg.Interface, err)
@@ -83,6 +89,42 @@ func (s *Server) Start() error {
 
 	go s.loop()
 	log.Printf("ra: advertising %s on %s (link-local %s, managed=%t)", s.cfg.Address6, s.cfg.Interface, src, s.cfg.Managed)
+	return nil
+}
+
+// ensureLinkLocal guarantees the interface has a link-local IPv6 address so
+// the NDP listener can bind. Right after a global address is assigned, the
+// kernel generates fe80:: asynchronously via addrconf, so we first wait for
+// it to appear; if it never does, we install fe80::1 explicitly.
+func ensureLinkLocal(ifi *net.Interface) error {
+	for i := 0; i < 20; i++ {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			return err
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ip := ipn.IP.To16(); ip != nil && ip.IsLinkLocalUnicast() {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	link, err := netlink.LinkByName(ifi.Name)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", ifi.Name, err)
+	}
+	ll, err := netlink.ParseAddr("fe80::1/64")
+	if err != nil {
+		return fmt.Errorf("parse fe80::1/64: %w", err)
+	}
+	if err := netlink.AddrAdd(link, ll); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("assign fe80::1/64 to %s: %w", ifi.Name, err)
+	}
 	return nil
 }
 
