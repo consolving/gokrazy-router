@@ -76,7 +76,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("ra: %s: %w", s.cfg.Interface, err)
 	}
-	conn, src, err := ndp.Listen(ifi, ndp.Addr(ll.String()))
+	conn, src, err := ndp.Listen(ifi, ndp.Addr(ll.WithZone("").String()))
 	if err != nil {
 		return fmt.Errorf("ra: listen on %s: %w", s.cfg.Interface, err)
 	}
