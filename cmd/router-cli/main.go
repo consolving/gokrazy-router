@@ -28,6 +28,7 @@ type PortInfo struct {
 
 type ClientInfo struct {
 	IP           string  `json:"ip"`
+	IP6          string  `json:"ip6,omitempty"`
 	MAC          string  `json:"mac"`
 	Via          string  `json:"via"`
 	Connected    bool    `json:"connected"`
@@ -163,7 +164,7 @@ func runStatus(args []string) {
 			fmt.Println("  (none)")
 		} else {
 			w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintf(w, "VIA\tIP\tMAC\tUL RATE\tDL RATE\tLINK\tSIGNAL\tUL\tDL\tTOTAL UL\tTOTAL DL\n")
+			fmt.Fprintf(w, "VIA\tIP\tIP6\tMAC\tUL RATE\tDL RATE\tLINK\tSIGNAL\tUL\tDL\tTOTAL UL\tTOTAL DL\n")
 			hasWiFi := false
 			for _, c := range connected {
 				via := c.Via
@@ -172,8 +173,8 @@ func runStatus(args []string) {
 				} else if via == "" {
 					via = "?"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					via, c.IP, c.MAC,
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					via, c.IP, c.IP6, c.MAC,
 					humanRate(c.RxRate), humanRate(c.TxRate),
 					formatLinkRate(c.LinkTxRate, c.LinkRxRate),
 					formatSignal(c.Signal),
@@ -194,14 +195,14 @@ func runStatus(args []string) {
 			fmt.Println()
 			fmt.Println("DISCONNECTED CLIENTS (historical)")
 			w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintf(w, "VIA\tIP\tMAC\tTOTAL UL\tTOTAL DL\tLAST SEEN\n")
+			fmt.Fprintf(w, "VIA\tIP\tIP6\tMAC\tTOTAL UL\tTOTAL DL\tLAST SEEN\n")
 			for _, c := range disconnected {
 				via := c.Via
 				if via == "" {
 					via = "?"
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-					via, c.IP, c.MAC,
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					via, c.IP, c.IP6, c.MAC,
 					humanBytes(c.TotalRxBytes), humanBytes(c.TotalTxBytes),
 					c.LastSeen)
 			}

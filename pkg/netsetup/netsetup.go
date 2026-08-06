@@ -12,13 +12,20 @@ import (
 )
 
 // Setup creates the LAN bridge, enslaves the given interfaces, assigns the
-// provided address (CIDR notation), brings everything up, and enables IP
-// forwarding.
-func Setup(bridgeName string, lanIfaces []string, addr string) (netlink.Link, error) {
-	// Parse address first so we fail early on bad input.
+// provided addresses (IPv4 and optionally IPv6, CIDR notation), brings
+// everything up, and enables IP forwarding.
+func Setup(bridgeName string, lanIfaces []string, addr, addr6 string) (netlink.Link, error) {
+	// Parse addresses first so we fail early on bad input.
 	ipNet, err := netlink.ParseAddr(addr)
 	if err != nil {
 		return nil, fmt.Errorf("parse address %q: %w", addr, err)
+	}
+	var ip6Net *netlink.Addr
+	if addr6 != "" {
+		ip6Net, err = netlink.ParseAddr(addr6)
+		if err != nil {
+			return nil, fmt.Errorf("parse address6 %q: %w", addr6, err)
+		}
 	}
 
 	// Create bridge if it doesn't already exist.
@@ -53,11 +60,20 @@ func Setup(bridgeName string, lanIfaces []string, addr string) (netlink.Link, er
 		log.Printf("netsetup: enslaved %s into %s", name, bridgeName)
 	}
 
-	// Assign IP address to bridge.
+	// Assign IPv4 address to bridge.
 	if err := netlink.AddrAdd(brLink, ipNet); err != nil {
 		// If address already exists, that's fine.
 		if !os.IsExist(err) {
 			return nil, fmt.Errorf("assign %s to %s: %w", addr, bridgeName, err)
+		}
+	}
+
+	// Assign optional IPv6 address to bridge.
+	if ip6Net != nil {
+		if err := netlink.AddrAdd(brLink, ip6Net); err != nil {
+			if !os.IsExist(err) {
+				return nil, fmt.Errorf("assign %s to %s: %w", addr6, bridgeName, err)
+			}
 		}
 	}
 
@@ -66,7 +82,7 @@ func Setup(bridgeName string, lanIfaces []string, addr string) (netlink.Link, er
 		return nil, fmt.Errorf("bring up %s: %w", bridgeName, err)
 	}
 
-	log.Printf("netsetup: %s up with %s", bridgeName, addr)
+	log.Printf("netsetup: %s up with %s%s", bridgeName, addr, optAddr6Log(addr6))
 	return brLink, nil
 }
 
@@ -77,6 +93,52 @@ func EnableForwarding() error {
 	}
 	log.Printf("netsetup: IPv4 forwarding enabled")
 	return nil
+}
+
+// EnableIPv6Forwarding enables IPv6 packet forwarding via /proc.
+func EnableIPv6Forwarding() error {
+	for _, key := range []string{"net/ipv6/conf/all/forwarding", "net/ipv6/conf/default/forwarding"} {
+		if err := os.WriteFile("/proc/sys/"+key, []byte("1"), 0644); err != nil {
+			return fmt.Errorf("enable ipv6 forwarding (%s): %w", key, err)
+		}
+	}
+	log.Printf("netsetup: IPv6 forwarding enabled")
+	return nil
+}
+
+// EnableSLAAC configures an interface to accept Router Advertisements and
+// auto-configure a global address via SLAAC. accept_ra=2 is required on
+// interfaces of a router that itself has IPv6 forwarding enabled.
+func EnableSLAAC(iface string) error {
+	for _, key := range []string{"accept_ra", "autoconf"} {
+		v := "1"
+		if key == "accept_ra" {
+			v = "2"
+		}
+		path := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/%s", iface, key)
+		if err := os.WriteFile(path, []byte(v), 0644); err != nil {
+			return fmt.Errorf("enable slaac %s on %s: %w", key, iface, err)
+		}
+	}
+	log.Printf("netsetup: SLAAC enabled on %s", iface)
+	return nil
+}
+
+// DisableIPv6 turns off IPv6 on an interface entirely.
+func DisableIPv6(iface string) error {
+	path := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", iface)
+	if err := os.WriteFile(path, []byte("1"), 0644); err != nil {
+		return fmt.Errorf("disable ipv6 on %s: %w", iface, err)
+	}
+	log.Printf("netsetup: IPv6 disabled on %s", iface)
+	return nil
+}
+
+func optAddr6Log(addr6 string) string {
+	if addr6 == "" {
+		return ""
+	}
+	return " and " + addr6
 }
 
 // BridgeAddIface adds an additional interface (e.g. wlan0) to an existing bridge.
