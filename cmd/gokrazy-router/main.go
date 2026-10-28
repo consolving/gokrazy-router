@@ -76,12 +76,20 @@ func main() {
 	// cfg cumulatively.
 	base := cloneConfig(cfg)
 
-	// 0. Optional: mount a disk used by SMB/PXE/extras config.
+	// 0. Optional: mount a disk used by SMB/PXE/extras config. A missing
+	// or broken disk must never take the router down: the network setup
+	// below is the critical function, SMB/PXE/extras are optional. On
+	// mount failure degrade gracefully instead of exiting.
 	if cfg.Services.Mount.Enabled {
 		if err := mount.Mount(cfg.Services.Mount); err != nil {
-			log.Fatalf("mount: %v", err)
+			log.Printf("mount: %v (continuing without %s: SMB/PXE/extras disabled)", err, cfg.Services.Mount.Target)
+			cfg.Services.SMB.Enabled = false
+			cfg.Services.PXE.Enabled = false
+			cfg.Services.ExtrasFile = ""
+			cfg.Services.Mount.Enabled = false
+		} else {
+			defer mount.Unmount(cfg.Services.Mount)
 		}
-		defer mount.Unmount(cfg.Services.Mount)
 	}
 
 	// Load optional extras file from the mounted volume. It overrides/extends
