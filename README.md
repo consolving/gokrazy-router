@@ -12,6 +12,8 @@ A Go daemon that turns a BananaPi R1 (Lamobo R1) into a home router, designed to
 - **WiFi + LAN shared subnet** — WiFi and a LAN port can share a subnet (split into two /25 ranges), with the router forwarding between them
 - **Per-client traffic monitoring** — nftables counters with live throughput rates, session and historical counters, exposed via an HTTP status API on the admin listener (loopback `127.0.0.1:8080` by default)
 - **PXE/TFTP boot server** — Serve boot images to PXE clients with a single TFTP server. DHCP automatically injects options 66/67 and selects the boot file by client type: legacy BIOS, UEFI, or iPXE (via DHCP option 77). Serve kernels, initrds, and iPXE binaries/scripts from a configurable TFTP root.
+- **Apple NetBoot (BSDP)** — Boot classic Macs over the network: DHCP answers `AAPLBSDPC/i386` / `AAPLBSDPC/ppc` clients with the BSDP option-43 payload, a TFTP booter (`macnbi-<arch>/booter`) and an NFS root-path pointing at the NetInstall image
+- **NFS server** — Serve the mounted disk via a bundled userspace NFSv3 server (`unfs3` + `rpcbind`), e.g. as the NetBoot image source; exports are generated from `services.nfs`
 - **Port speed detection** — Reads negotiated link speed and duplex from sysfs
 - **Status CLI** — `router-cli` queries the API and prints port/client tables
 - **Disk mount** — Mount a block device via environment variables for use by SMB/PXE/extras config
@@ -195,6 +197,36 @@ Share the mounted volume via SMB. The credentials use `${ENV}` expansion so they
 
 A statically linked `smbd` (and `smbpasswd`) must be bundled via ExtraFilePaths, just like `hostapd`.
 
+### NFS server
+
+Serve the mounted volume via NFSv3. Like SMB, the server is an external binary bundled via ExtraFilePaths: a statically linked `unfsd` (userspace NFS server, [unfs3](https://github.com/unfs3/unfs3)) plus `rpcbind` (portmapper, required for mountd discovery). Build both with `build-nfs.sh` (Alpine armv7 in Docker via qemu).
+
+```json
+"nfs": {
+  "enabled": true,
+  "exportPath": "/mnt/sata/netboot",
+  "clients": "10.0.31.0/25"
+}
+```
+
+Supported fields:
+
+| Field | Purpose |
+|-------|---------|
+| `unfsdBin` | Path to the `unfsd` binary (default `/usr/local/bin/unfsd`) |
+| `rpcbindBin` | Path to the portmapper (default `/usr/local/bin/rpcbind`); set to `"-"` to skip — without a portmapper clients cannot discover the mountd port |
+| `exportPath` | Directory to export (default `<mountTarget>/netboot`); must exist on the mounted disk |
+| `clients` | Export ACL: host, CIDR or `*` (default) |
+| `readWrite` | Export read-write (default: read-only) |
+| `rootSquash` | Enable root squashing (default: `no_root_squash`, which Mac NetBoot booters need to read images as root) |
+| `extraExports` | Raw exports-file lines appended to the generated entry |
+| `exportsFile` | Path for the generated exports file (default `/tmp/nfs-exports`) |
+| `nfsPort` / `mountdPort` | Fixed service ports (default 2049 / 20048) |
+
+The exports file is written at startup; changing exports requires a restart. unfs3 speaks NFSv3 over UDP and TCP with fixed ports — sufficient for NetBoot images and file serving; it does not provide NFSv4 or high concurrency.
+
+Appliance requirements: gokrazy ships no `/etc/netconfig`, `/etc/services`, `/etc/passwd` or `/etc/group`, but libtirpc and rpcbind need them. Bundle all four via gokrazy `ExtraFileContents` (see `netboot/gokrazy-router.json` — it is not an example file but the gokrazy instance config in this deployment; `build-nfs.sh` already patches the rpcbind paths from `/var/run` to `/run`, since gokrazy only has a tmpfs there).
+
 ### PXE/TFTP server
 
 Serve boot images to PXE clients. The TFTP server listens on UDP/69. Its root directory defaults to `<mountTarget>/tftpboot`. The TFTP root is a strict jail: requests for absolute paths, `..` traversal or symlinks that resolve outside the root are rejected with a TFTP error, and every path component is opened with no-follow semantics so a symlink swapped in between validation and open cannot escape the root — a client cannot read arbitrary files from the router. Each transfer runs on its own ephemeral UDP port (standard TFTP transfer ID), which keeps concurrent clients isolated.
@@ -229,8 +261,12 @@ Supported fields:
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE |
 | `bindInterface` | Optional `SO_BINDTODEVICE` interface (e.g. `br-vlan31`). Leave empty to serve every scope that advertises option 66/67 — replies are routed out the correct bridge automatically |
+| `appleNetBoot` | Answer Apple NetBoot (BSDP) clients, see [Apple NetBoot (Mac)](#apple-netboot-mac) |
+| `appleIntelBootFile` / `applePPCBootFile` | Option 67 for `AAPLBSDPC/i386` / `AAPLBSDPC/ppc` (default `macnbi-<arch>/booter`) |
+| `appleIntelRootPath` / `applePPCRootPath` | Option 17 root-path per arch, e.g. `nfs:192.168.0.10:/export:NetInstall.dmg` |
+| `appleImageID` | BSDP boot image ID for option 43 (default `0x81000067`, ppc `0x81000009`) |
 
-DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. Boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > bootFile/defaultImage`. If `pxeBootServer`/`pxeBootFile` are set on a `dhcp` block, those values override the global `services.pxe` defaults for that scope.
+DHCP replies automatically include option 66 (TFTP server) and option 67 (boot file) when PXE is enabled. Boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > Apple NetBoot (appleNetBoot, AAPLBSDPC clients only) > uefiBootFile/legacyBootFile > bootFile/defaultImage`. If `pxeBootServer`/`pxeBootFile` are set on a `dhcp` block, those values override the global `services.pxe` defaults for that scope.
 
 #### Booting netboot.xyz
 
@@ -265,6 +301,82 @@ To load the public [netboot.xyz](https://netboot.xyz) menu on legacy BIOS client
 Legacy PXE ROM receives `netboot.xyz.kpxe` (the iPXE binary), iPXE starts and then receives `netboot.xyz.ipxe` (the script) via DHCP option 77, and the script loads the live netboot.xyz menu.
 
 For UEFI clients, provide `netboot.xyz.efi` as `uefiBootFile`.
+
+#### Apple NetBoot (Mac)
+
+Classic Macs can boot over the network via Apple's BSDP protocol (vendor class `AAPLBSDPC`). The router answers these DHCP clients with the BSDP option-43 payload (selected boot image ID), a TFTP booter and an NFS root-path, following the proven [Linux NetBoot recipe](https://kb.pocnet.net/wiki/Mac_OS_X_Maschine_%C3%BCber_Netzwerk_booten). Enable it with `appleNetBoot`:
+
+```json
+"services": {
+  "nfs": {
+    "enabled": true,
+    "exportPath": "/mnt/data/netboot",
+    "clients": "10.0.31.0/25"
+  },
+  "pxe": {
+    "enabled": true,
+    "tftpRoot": "/mnt/data/tftpboot",
+    "appleNetBoot": true,
+    "appleIntelRootPath": "nfs:10.0.31.1:/mnt/data/netboot:NetInstall.dmg"
+  }
+}
+```
+
+Requirements:
+
+1. **TFTP** — the booter must exist under the TFTP root as `macnbi-i386/booter` (Intel) and/or `macnbi-ppc/booter` (PowerPC). Copy the `i386/` and `ppc/` directories of the NBI bundle created with Apple's System Image Utility there:
+
+   ```
+   /mnt/data/tftpboot/macnbi-i386/booter
+   /mnt/data/tftpboot/macnbi-i386/com.apple.Boot.plist
+   /mnt/data/tftpboot/macnbi-i386/x86_64         (kernelcache)
+   ```
+
+2. **NFS** — the root-path option (17) points at an NFS server (`nfs:SERVER:/export:IMAGE.dmg`); the exported directory must contain the `.dmg` and be exported read-only. Use the [built-in NFS server](#nfs-server) (`services.nfs` exporting `/mnt/sata/netboot`) or an external one (`async,ro,no_root_squash,insecure`). The NFS server must be reachable from the client's VLAN.
+
+3. **DHCP** — handled automatically: clients identifying as `AAPLBSDPC/i386` get `macnbi-i386/booter`, `AAPLBSDPC/ppc` get `macnbi-ppc/booter`, each with the matching root-path. The option-43 boot image ID defaults to `0x81000067` (i386) / `0x81000009` (ppc) and can be overridden with `appleImageID`. Per-MAC boot files (`macImages`) still take precedence over the Apple classification.
+
+##### Creating a NetInstall image
+
+NetInstall/NetBoot images are produced by Apple's **System Image Utility** (SIU). Availability has been cut back over the years:
+
+| Build Mac runs | Where to get SIU | Notes |
+|---|---|---|
+| Mac OS X 10.4 – 10.7 | [Server Admin Tools](https://support.apple.com/kb/DL1596) (10.5: DL831, 10.6: DL1403, 10.7: DL1596) | the classic path, used for the [Linux NetBoot recipe](https://kb.pocnet.net/wiki/Mac_OS_X_Maschine_%C3%BCber_Netzwerk_booten) |
+| OS X/macOS 10.8 – 10.13 | bundled inside `Server.app` (macOS Server ≤ 5.7) | last versions that can create NetInstall images |
+| macOS 10.14 (Mojave) and later | none — Server 5.7.1 removed NetInstall, and the DHCP service GUI went with it | Macs with a T2 chip or Apple silicon cannot NetBoot at all |
+
+The SIU version must match the OS version you want to install: to build a Yosemite NetInstall you need to run the Yosemite-era SIU on a Mac running Yosemite.
+
+Workflow (example: Mac OS X 10.6 NetInstall):
+
+1. Get an install source: the `Install Mac OS X.app`/`InstallESD.dmg` of the target version, or for NetBoot/NetRestore a never-booted system volume (e.g. built with [AutoDMG](https://github.com/MagerValp/AutoDMG)).
+2. Open SIU, set the source to the installer/volume, choose **NetInstall Image** (installs to the client's disk), **NetBoot Image** (boots the OS from the server) or **NetRestore Image** (wipes the client disk and restores a prepared volume — destructive!).
+3. Work through the wizard (name, admin account, optional packages/profiles, supported models) and save. The result is a `.nbi` bundle:
+
+   ```
+   MyImage.nbi/
+     NBImageInfo.plist        # metadata (image ID, arch, default flag) — ignored by gokrazy-router
+     NetInstall.dmg           # the root image referenced by the root-path option
+     i386/
+       booter                 # TFTP boot file (DHCP option 67)
+       com.apple.Boot.plist   # kernel path + flags, fetched by the booter via TFTP
+       x86_64/                # kernelcache / mach.macosx, fetched via TFTP
+       PlatformSupport.plist
+   ```
+
+4. Copy the bundle to the router (SMB share `\\<router>\sata`):
+
+   ```
+   i386/*  → /mnt/sata/tftpboot/macnbi-i386/
+   NetInstall.dmg → /mnt/sata/netboot/NetInstall.dmg
+   ```
+
+   The `.dmg` name must match the last component of `appleIntelRootPath` (default `NetInstall.dmg`); the TFTP and NFS servers serve from disk, so no restart is needed.
+
+5. Boot the client on a scope served by the router (e.g. VLAN 31): power on holding **Option/Alt** and select the network globe. The Mac sends a BSDP DHCPDISCOVER, receives an OFFER with the boot image ID, then a REQUEST/ACK cycle delivers booter path and root-path — the booter loads via TFTP from the router and mounts the `.dmg` via NFS.
+
+The image OS version must be supported by the client's boot ROM; the classic BSDP flow is proven for Mac OS X 10.5/10.6-era Intel Macs (the pocnet recipe) and works for later Intel models that still ship Apple's EFI NetBoot client.
 
 ### Static DHCP reservations
 
@@ -303,10 +415,11 @@ Supported keys:
 | `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
 | `uefiBootFile` | Option 67 for UEFI PXE clients |
 | `ipxeScript` | Option 67 once a client identifies itself as iPXE (option 77) |
+| `appleNetBoot` | Answer Apple NetBoot (BSDP) clients (see [Apple NetBoot (Mac)](#apple-netboot-mac)); boot files/root-paths per arch, defaults `macnbi-<arch>/booter` |
 | `[vlanAddresses]` | `id = "cidr"` address override per VLAN (e.g. for per-VLAN TFTP/DHCP scopes). Applying changes requires a router restart — `/api/reload` rejects them with HTTP 409 |
 | `[[smbUsers]]` | Extra SMB users: `name`, `password`. Granted access at startup; adding/removing users requires a router restart — `/api/reload` rejects the change with HTTP 409 |
 
-The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. This is deliberate: once a client runs iPXE, its `ipxeScript` must win over the MAC mapping or the client would never leave the initial boot loader. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
+The PXE boot-file precedence is `iPXE (ipxeScript) > per-MAC (macImages) > Apple NetBoot (appleNetBoot, AAPLBSDPC clients only) > uefiBootFile/legacyBootFile > pxeBootFile/defaultImage`. This is deliberate: once a client runs iPXE, its `ipxeScript` must win over the MAC mapping or the client would never leave the initial boot loader. TFTP images themselves are served directly from disk, so dropping a new file into the TFTP root is enough — no restart needed. Extras-driven reservations and PXE settings require a restart or `/api/reload`.
 
 ### Admin API
 

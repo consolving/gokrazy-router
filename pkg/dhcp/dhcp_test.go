@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"bytes"
 	"net"
 	"sync"
 	"testing"
@@ -463,5 +464,162 @@ func TestNormalizeMAC(t *testing.T) {
 		if got != c.want {
 			t.Errorf("normalizeMAC(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func appleTestServer() *Server {
+	s := &Server{
+		iface:    "eth0",
+		serverIP: net.ParseIP("10.0.0.1").To4(),
+		mask:     net.CIDRMask(24, 32),
+	}
+	s.SetLegacyBootFile("undionly.kpxe")
+	s.SetUEFIBootFile("netboot.xyz.efi")
+	s.SetAppleNetBoot(true, "", "",
+		"nfs:192.168.0.10:/export:NetInstall-i386.dmg",
+		"nfs:192.168.0.10:/export:NetInstall-ppc.dmg", 0)
+	return s
+}
+
+func appleReply(t *testing.T, s *Server, req *dhcpv4.DHCPv4) *dhcpv4.DHCPv4 {
+	t.Helper()
+	mod := s.replyOptions("aa:bb:cc:dd:ee:ff", req)
+	resp, err := dhcpv4.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod(resp)
+	return resp
+}
+
+func appleRequest(msgType dhcpv4.MessageType, class string) *dhcpv4.DHCPv4 {
+	req, err := dhcpv4.New(
+		dhcpv4.WithMessageType(msgType),
+		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte(class)),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return req
+}
+
+func TestAppleNetBootIntel(t *testing.T) {
+	s := appleTestServer()
+
+	// Intel EFI client DISCOVER: booter, root path, vendor class echo and the
+	// selected boot image ID (default 0x81000067) in option 43.
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-i386/booter" {
+		t.Errorf("i386 bootfile = %q, want macnbi-i386/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
+		t.Errorf("i386 root-path = %q", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x67}) {
+		t.Errorf("i386 option 43 = % x, want 08 04 81 00 00 67", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionClassIdentifier)); got != "AAPLBSDPC/i386" {
+		t.Errorf("i386 option 60 = %q, want AAPLBSDPC/i386", got)
+	}
+
+	// REQUEST: booter and root path again (the booter re-requests DHCP to read
+	// the root path), but no option 43 or vendor class echo per the recipe.
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeRequest, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-i386/booter" {
+		t.Errorf("i386 REQUEST bootfile = %q, want macnbi-i386/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
+		t.Errorf("i386 REQUEST root-path = %q", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); got != nil {
+		t.Errorf("i386 REQUEST option 43 = % x, want none", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionClassIdentifier); got != nil {
+		t.Errorf("i386 REQUEST option 60 = %q, want none", got)
+	}
+}
+
+func TestAppleNetBootPPC(t *testing.T) {
+	s := appleTestServer()
+
+	// PowerPC Open Firmware DISCOVER: ppc booter, ppc root path and the ppc
+	// default image ID 0x81000009.
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/ppc"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("ppc bootfile = %q, want macnbi-ppc/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
+		t.Errorf("ppc root-path = %q", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+		t.Errorf("ppc option 43 = % x, want 08 04 81 00 00 09", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionClassIdentifier)); got != "AAPLBSDPC/ppc" {
+		t.Errorf("ppc option 60 = %q, want AAPLBSDPC/ppc", got)
+	}
+
+	// Non-DISCOVER messages get the static fallback payload from the recipe.
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeRequest, "AAPLBSDPC/ppc"))
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}) {
+		t.Errorf("ppc REQUEST option 43 = % x, want 00 01 02 03 04 05 06 07", got)
+	}
+
+	// A bare AAPLBSDPC vendor class is treated as ppc (old-world Open Firmware).
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("bare AAPLBSDPC bootfile = %q, want macnbi-ppc/booter", got)
+	}
+}
+
+func TestAppleNetBootCustomImageID(t *testing.T) {
+	s := appleTestServer()
+	s.SetAppleNetBoot(true, "custom/booter", "", "nfs:10.0.0.5:/srv:Custom.dmg", "", 0x81000042)
+
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "custom/booter" {
+		t.Errorf("custom bootfile = %q, want custom/booter", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x42}) {
+		t.Errorf("custom option 43 = % x, want 08 04 81 00 00 42", got)
+	}
+}
+
+func TestAppleNetBootDisabledAndPrecedence(t *testing.T) {
+	s := appleTestServer()
+
+	// Without Apple NetBoot, an AAPLBSDPC client falls through to the default
+	// bootfile selection and gets none of the BSDP options.
+	s.SetAppleNetBoot(false, "", "", "", "", 0)
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "undionly.kpxe" {
+		t.Errorf("disabled bootfile = %q, want undionly.kpxe", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionRootPath); got != nil {
+		t.Errorf("disabled root-path = %q, want none", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); got != nil {
+		t.Errorf("disabled option 43 = % x, want none", got)
+	}
+
+	// Per-MAC overrides take precedence over the Apple classification.
+	s.SetAppleNetBoot(true, "", "",
+		"nfs:192.168.0.10:/export:NetInstall-i386.dmg",
+		"nfs:192.168.0.10:/export:NetInstall-ppc.dmg", 0)
+	s.SetMacPXEBootFiles(map[string]string{"aa:bb:cc:dd:ee:ff": "my-custom.ipxe"})
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "my-custom.ipxe" {
+		t.Errorf("MAC override bootfile = %q, want my-custom.ipxe", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionRootPath); got != nil {
+		t.Errorf("MAC override root-path = %q, want none", got)
+	}
+}
+
+func TestBSDPSelectImagePayload(t *testing.T) {
+	if got := bsdpSelectImage(0x81000067); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x67}) {
+		t.Errorf("bsdpSelectImage = % x", got)
+	}
+	if got := bsdpSelectImage(0x81000009); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+		t.Errorf("bsdpSelectImage = % x", got)
 	}
 }
