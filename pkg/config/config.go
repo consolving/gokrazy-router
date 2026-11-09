@@ -83,6 +83,7 @@ type WiFiConfig struct {
 type ServicesConfig struct {
 	Mount      MountConfig    `json:"mount,omitempty"`
 	SMB        SMBConfig      `json:"smb,omitempty"`
+	NFS        NFSConfig      `json:"nfs,omitempty"`
 	PXE        PXEConfig      `json:"pxe,omitempty"`
 	ExtrasFile string         `json:"extrasFile,omitempty"` // path to TOML extras file (dynamic reservations, images, ...)
 	AdminAPI   AdminAPIConfig `json:"adminAPI,omitempty"`
@@ -122,6 +123,23 @@ type SMBConfig struct {
 	UsePortableServer bool   `json:"usePortableServer,omitempty"` // use fiddyschmitt/portable-smb-server instead of Samba smbd
 }
 
+// NFSConfig starts a userspace NFSv3 server (unfs3) to serve the mounted
+// volume, e.g. for Mac NetBoot root images referenced by DHCP root-path.
+// The binaries are external and must be bundled via gokrazy ExtraFilePaths.
+type NFSConfig struct {
+	Enabled      bool     `json:"enabled"`
+	UnfsdBin     string   `json:"unfsdBin,omitempty"`     // default: /usr/local/bin/unfsd
+	RpcbindBin   string   `json:"rpcbindBin,omitempty"`   // default: /usr/local/bin/rpcbind; set to "-" to skip
+	ExportPath   string   `json:"exportPath,omitempty"`   // directory to export; default: <mountTarget>/netboot
+	Clients      string   `json:"clients,omitempty"`      // export ACL, default "*", e.g. "10.0.31.0/25"
+	ReadWrite    bool     `json:"readWrite,omitempty"`    // default: read-only
+	RootSquash   bool     `json:"rootSquash,omitempty"`   // default: no_root_squash (Mac booter reads images as root)
+	ExtraExports []string `json:"extraExports,omitempty"` // appended raw exports-file lines
+	ExportsFile  string   `json:"exportsFile,omitempty"`  // default: /tmp/nfs-exports
+	NFSPort      int      `json:"nfsPort,omitempty"`      // default: 2049
+	MountdPort   int      `json:"mountdPort,omitempty"`   // default: 20048
+}
+
 // PXEConfig starts a TFTP server and answers PXE boot requests.
 type PXEConfig struct {
 	Enabled        bool              `json:"enabled"`
@@ -134,21 +152,37 @@ type PXEConfig struct {
 	LegacyBootFile string            `json:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
 	UEFIBootFile   string            `json:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
 	IPXEScript     string            `json:"ipxeScript,omitempty"`     // option 67 once an iPXE client identifies itself
+	// Apple NetBoot (BSDP): answer classic Mac "AAPLBSDPC" clients. The booter
+	// is served via TFTP from tftpRoot (macnbi-<arch>/booter), the root image
+	// comes from an external NFS server referenced in the root-path option.
+	AppleNetBoot       bool   `json:"appleNetBoot,omitempty"`       // answer AAPLBSDPC (Apple NetBoot/BSDP) clients
+	AppleIntelBootFile string `json:"appleIntelBootFile,omitempty"` // option 67 for AAPLBSDPC/i386 (default macnbi-i386/booter)
+	ApplePPCBootFile   string `json:"applePPCBootFile,omitempty"`   // option 67 for AAPLBSDPC/ppc (default macnbi-ppc/booter)
+	AppleIntelRootPath string `json:"appleIntelRootPath,omitempty"` // option 17 for i386, e.g. nfs:192.168.0.10:/export:NetInstall.dmg
+	ApplePPCRootPath   string `json:"applePPCRootPath,omitempty"`   // option 17 for ppc
+	AppleImageID       uint32 `json:"appleImageID,omitempty"`       // BSDP boot image ID for option 43 (default 0x81000067)
 }
 
 // ExtrasConfig can be placed on the mounted volume and edited at runtime.
 // It is loaded after the JSON config and merged into the active configuration.
 type ExtrasConfig struct {
-	Reservations   map[string]string `toml:"reservations"`              // MAC -> IP
-	MacImages      map[string]string `toml:"macImages"`                 // MAC -> PXE image filename
-	DefaultImage   string            `toml:"defaultImage"`              // PXE default image (overrides router.json)
-	PXEBootFile    string            `toml:"pxeBootFile"`               // DHCP option 67 bootfile (applied to all subnets)
-	LegacyBootFile string            `toml:"legacyBootFile,omitempty"`  // option 67 for legacy BIOS PXE clients
-	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`    // option 67 for UEFI PXE clients
-	IPXEScript     string            `toml:"ipxeScript,omitempty"`      // option 67 once iPXE identifies itself
-	SMBUsers       []SMBUser         `toml:"smbUsers"`                  // additional SMB users
-	VLANAddresses  map[int]string    `toml:"vlanAddresses,omitempty"`   // VLAN ID -> CIDR address override
-	DNS            []string          `toml:"dns,omitempty"`             // default DNS for all DHCP scopes
+	Reservations   map[string]string `toml:"reservations"`             // MAC -> IP
+	MacImages      map[string]string `toml:"macImages"`                // MAC -> PXE image filename
+	DefaultImage   string            `toml:"defaultImage"`             // PXE default image (overrides router.json)
+	PXEBootFile    string            `toml:"pxeBootFile"`              // DHCP option 67 bootfile (applied to all subnets)
+	LegacyBootFile string            `toml:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
+	UEFIBootFile   string            `toml:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
+	IPXEScript     string            `toml:"ipxeScript,omitempty"`     // option 67 once iPXE identifies itself
+	// Apple NetBoot (BSDP) overrides; replace the router.json values on reload.
+	AppleNetBoot       bool           `toml:"appleNetBoot,omitempty"`
+	AppleIntelBootFile string         `toml:"appleIntelBootFile,omitempty"`
+	ApplePPCBootFile   string         `toml:"applePPCBootFile,omitempty"`
+	AppleIntelRootPath string         `toml:"appleIntelRootPath,omitempty"`
+	ApplePPCRootPath   string         `toml:"applePPCRootPath,omitempty"`
+	AppleImageID       uint32         `toml:"appleImageID,omitempty"`
+	SMBUsers           []SMBUser      `toml:"smbUsers"`                // additional SMB users
+	VLANAddresses      map[int]string `toml:"vlanAddresses,omitempty"` // VLAN ID -> CIDR address override
+	DNS                []string       `toml:"dns,omitempty"`           // default DNS for all DHCP scopes
 }
 
 // SMBUser describes a user for the SMB share (only valid inside ExtrasConfig).
@@ -278,6 +312,14 @@ func (c *Config) ExpandEnv() {
 	c.Services.SMB.User = e(c.Services.SMB.User)
 	c.Services.SMB.Password = e(c.Services.SMB.Password)
 
+	c.Services.NFS.UnfsdBin = e(c.Services.NFS.UnfsdBin)
+	c.Services.NFS.RpcbindBin = e(c.Services.NFS.RpcbindBin)
+	c.Services.NFS.ExportPath = e(c.Services.NFS.ExportPath)
+	c.Services.NFS.ExportsFile = e(c.Services.NFS.ExportsFile)
+	for i := range c.Services.NFS.ExtraExports {
+		c.Services.NFS.ExtraExports[i] = e(c.Services.NFS.ExtraExports[i])
+	}
+
 	c.Services.PXE.Listen = e(c.Services.PXE.Listen)
 	c.Services.PXE.TFTPRoot = e(c.Services.PXE.TFTPRoot)
 	c.Services.PXE.DefaultImage = e(c.Services.PXE.DefaultImage)
@@ -285,6 +327,10 @@ func (c *Config) ExpandEnv() {
 	c.Services.PXE.LegacyBootFile = e(c.Services.PXE.LegacyBootFile)
 	c.Services.PXE.UEFIBootFile = e(c.Services.PXE.UEFIBootFile)
 	c.Services.PXE.IPXEScript = e(c.Services.PXE.IPXEScript)
+	c.Services.PXE.AppleIntelBootFile = e(c.Services.PXE.AppleIntelBootFile)
+	c.Services.PXE.ApplePPCBootFile = e(c.Services.PXE.ApplePPCBootFile)
+	c.Services.PXE.AppleIntelRootPath = e(c.Services.PXE.AppleIntelRootPath)
+	c.Services.PXE.ApplePPCRootPath = e(c.Services.PXE.ApplePPCRootPath)
 	for k, v := range c.Services.PXE.MacImages {
 		c.Services.PXE.MacImages[k] = e(v)
 	}
@@ -335,6 +381,12 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 	c.Services.PXE.LegacyBootFile = extras.LegacyBootFile
 	c.Services.PXE.UEFIBootFile = extras.UEFIBootFile
 	c.Services.PXE.IPXEScript = extras.IPXEScript
+	c.Services.PXE.AppleNetBoot = extras.AppleNetBoot
+	c.Services.PXE.AppleIntelBootFile = extras.AppleIntelBootFile
+	c.Services.PXE.ApplePPCBootFile = extras.ApplePPCBootFile
+	c.Services.PXE.AppleIntelRootPath = extras.AppleIntelRootPath
+	c.Services.PXE.ApplePPCRootPath = extras.ApplePPCRootPath
+	c.Services.PXE.AppleImageID = extras.AppleImageID
 	for i := range c.VLANs {
 		c.VLANs[i].DHCP.PXEBootFile = extras.PXEBootFile
 	}
@@ -386,6 +438,12 @@ func ExtrasFromConfig(c *Config) *ExtrasConfig {
 	e.LegacyBootFile = c.Services.PXE.LegacyBootFile
 	e.UEFIBootFile = c.Services.PXE.UEFIBootFile
 	e.IPXEScript = c.Services.PXE.IPXEScript
+	e.AppleNetBoot = c.Services.PXE.AppleNetBoot
+	e.AppleIntelBootFile = c.Services.PXE.AppleIntelBootFile
+	e.ApplePPCBootFile = c.Services.PXE.ApplePPCBootFile
+	e.AppleIntelRootPath = c.Services.PXE.AppleIntelRootPath
+	e.ApplePPCRootPath = c.Services.PXE.ApplePPCRootPath
+	e.AppleImageID = c.Services.PXE.AppleImageID
 	e.VLANAddresses = make(map[int]string)
 	for _, v := range c.VLANs {
 		e.VLANAddresses[v.ID] = v.Address

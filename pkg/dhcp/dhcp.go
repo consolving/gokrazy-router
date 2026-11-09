@@ -45,9 +45,41 @@ type Server struct {
 	ipxeBootFile    string            // bootfile for clients that already run iPXE
 	uefiBootFile    string            // bootfile for UEFI PXE clients
 	legacyBootFile  string            // bootfile for legacy BIOS PXE clients
+	appleNetBoot    appleNetBootConfig
 	onLease         LeaseCallback
 	onLeaseExpired  LeaseExpiredCallback
 }
+
+// appleNetBootConfig holds the per-architecture settings for Apple NetBoot
+// (BSDP) clients. The booter is fetched via TFTP, the root image (a .dmg) is
+// mounted from an external NFS server via the root-path option.
+type appleNetBootConfig struct {
+	Enabled       bool
+	IntelBootFile string
+	PPCBootFile   string
+	IntelRootPath string
+	PPCRootPath   string
+	IntelImageID  uint32
+	PPCImageID    uint32
+}
+
+// BSDP constants from the reference recipe for ISC dhcpd ("Mac OS X Maschine
+// über Netzwerk booten", kb.pocnet.net): Apple clients are matched by the
+// AAPLBSDPC vendor class and answered with the selected boot image ID inside
+// vendor-encapsulated options (DHCP option 43, BSDP sub-option 8).
+const (
+	appleVendorClass = "AAPLBSDPC"
+
+	bsdpSubOptionSelectedImage = 8
+
+	// Default BSDP boot image IDs used when no explicit image ID is
+	// configured. The 0x81000000 flag marks a bootable network disk image.
+	appleIntelDefaultImageID = 0x81000067
+	applePPCDefaultImageID   = 0x81000009
+
+	appleIntelVendorClass = appleVendorClass + "/i386"
+	applePPCVendorClass   = appleVendorClass + "/ppc"
+)
 
 type lease struct {
 	IP      net.IP
@@ -170,6 +202,39 @@ func (s *Server) SetLegacyBootFile(file string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.legacyBootFile = file
+}
+
+// SetAppleNetBoot configures answers for Apple NetBoot (BSDP) clients. Boot
+// files and root paths are selected by the client architecture reported in the
+// vendor class identifier (AAPLBSDPC/i386 for Intel EFI, AAPLBSDPC/ppc for
+// PowerPC Open Firmware). Empty boot files fall back to the conventional
+// macnbi-<arch>/booter TFTP paths; a zero image ID selects the default from
+// the reference recipe (0x81000067 for i386, 0x81000009 for ppc).
+func (s *Server) SetAppleNetBoot(enabled bool, intelBootFile, ppcBootFile, intelRootPath, ppcRootPath string, imageID uint32) {
+	if intelBootFile == "" {
+		intelBootFile = "macnbi-i386/booter"
+	}
+	if ppcBootFile == "" {
+		ppcBootFile = "macnbi-ppc/booter"
+	}
+	intelID, ppcID := imageID, imageID
+	if intelID == 0 {
+		intelID = appleIntelDefaultImageID
+	}
+	if ppcID == 0 {
+		ppcID = applePPCDefaultImageID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appleNetBoot = appleNetBootConfig{
+		Enabled:       enabled,
+		IntelBootFile: intelBootFile,
+		PPCBootFile:   ppcBootFile,
+		IntelRootPath: intelRootPath,
+		PPCRootPath:   ppcRootPath,
+		IntelImageID:  intelID,
+		PPCImageID:    ppcID,
+	}
 }
 
 func normalizeMAC(mac string) string {
@@ -430,9 +495,12 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		ipxe := s.ipxeBootFile
 		uefi := s.uefiBootFile
 		legacy := s.legacyBootFile
+		apple := s.appleNetBoot
 		s.mu.Unlock()
 
 		classified := ""
+		var appleRootPath string
+		var appleImageID uint32
 		switch {
 		case ipxe != "" && req != nil && isIPXEClient(req):
 			bootFile = ipxe
@@ -440,6 +508,21 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		case hasMacFile:
 			bootFile = macFile
 			classified = "mac"
+		case apple.Enabled && req != nil && isAppleBSDPClient(req):
+			// Apple NetBoot (BSDP): booter file and root path depend on the
+			// client architecture from the vendor class identifier.
+			switch appleVendorArch(req) {
+			case "i386":
+				bootFile = apple.IntelBootFile
+				appleRootPath = apple.IntelRootPath
+				appleImageID = apple.IntelImageID
+				classified = "apple-i386"
+			case "ppc":
+				bootFile = apple.PPCBootFile
+				appleRootPath = apple.PPCRootPath
+				appleImageID = apple.PPCImageID
+				classified = "apple-ppc"
+			}
 		case uefi != "" && req != nil && isUEFIClient(req):
 			bootFile = uefi
 			classified = "uefi"
@@ -456,7 +539,62 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			log.Printf("dhcp: %s selected %s bootfile=%s", mac, classified, bootFile)
 			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
 		}
+		if classified == "apple-i386" || classified == "apple-ppc" {
+			// BSDP payload per the reference recipe: root path (option 17) on
+			// every reply, vendor class echo (option 60) and the selected boot
+			// image ID in vendor-encapsulated options (option 43) with
+			// per-message-type rules.
+			if appleRootPath != "" {
+				log.Printf("dhcp: %s sending option 17 root-path=%s", mac, appleRootPath)
+				d.UpdateOption(dhcpv4.OptRootPath(appleRootPath))
+			}
+			if req == nil {
+				return
+			}
+			switch {
+			case classified == "apple-i386" && req.MessageType() == dhcpv4.MessageTypeDiscover:
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(appleIntelVendorClass)))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(appleImageID)))
+			case classified == "apple-ppc" && req.MessageType() == dhcpv4.MessageTypeDiscover:
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(appleImageID)))
+			case classified == "apple-ppc":
+				// The ppc class in the reference recipe answers any message
+				// type other than DISCOVER with the static fallback payload.
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation,
+					[]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}))
+			}
+		}
 	}
+}
+
+// isAppleBSDPClient reports whether the request carries the Apple NetBoot
+// (BSDP) vendor class identifier (AAPLBSDPC, AAPLBSDPC/i386 or AAPLBSDPC/ppc).
+func isAppleBSDPClient(req *dhcpv4.DHCPv4) bool {
+	vc := req.Options.Get(dhcpv4.OptionClassIdentifier)
+	return len(vc) >= len(appleVendorClass) &&
+		bytes.Equal(bytes.ToLower(vc[:len(appleVendorClass)]), []byte(strings.ToLower(appleVendorClass)))
+}
+
+// appleVendorArch returns the architecture of an AAPLBSDPC client: "i386" for
+// Intel EFI clients, "ppc" for PowerPC Open Firmware clients. A bare
+// AAPLBSDPC vendor class is treated as ppc (old-world Open Firmware).
+func appleVendorArch(req *dhcpv4.DHCPv4) string {
+	if strings.HasPrefix(string(req.Options.Get(dhcpv4.OptionClassIdentifier)), appleVendorClass+"/i386") {
+		return "i386"
+	}
+	return "ppc"
+}
+
+// bsdpSelectImage builds the BSDP option 43 "selected boot image" payload:
+// sub-option 8 with a 4-byte big-endian boot image ID.
+func bsdpSelectImage(id uint32) []byte {
+	b := make([]byte, 6)
+	b[0] = bsdpSubOptionSelectedImage
+	b[1] = 4
+	binary.BigEndian.PutUint32(b[2:6], id)
+	return b
 }
 
 func isIPXEClient(req *dhcpv4.DHCPv4) bool {

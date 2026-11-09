@@ -131,6 +131,7 @@ func TestExpandEnv(t *testing.T) {
 	t.Setenv("DISK_TARGET", "/mnt/data")
 	t.Setenv("SMB_USER", "alice")
 	t.Setenv("TFTP_ROOT", "/tftpboot")
+	t.Setenv("NAS_IP", "192.168.0.10")
 
 	cfg := &Config{
 		Services: ServicesConfig{
@@ -142,7 +143,8 @@ func TestExpandEnv(t *testing.T) {
 				User: "${SMB_USER}",
 			},
 			PXE: PXEConfig{
-				TFTPRoot: "${TFTP_ROOT}",
+				TFTPRoot:           "${TFTP_ROOT}",
+				AppleIntelRootPath: "nfs:${NAS_IP}:/export:NetInstall.dmg",
 				MacImages: map[string]string{
 					"aa:bb:cc:dd:ee:ff": "${TFTP_ROOT}/img.bin",
 				},
@@ -162,6 +164,9 @@ func TestExpandEnv(t *testing.T) {
 	}
 	if cfg.Services.PXE.TFTPRoot != "/tftpboot" {
 		t.Errorf("PXE.TFTPRoot = %q, want /tftpboot", cfg.Services.PXE.TFTPRoot)
+	}
+	if cfg.Services.PXE.AppleIntelRootPath != "nfs:192.168.0.10:/export:NetInstall.dmg" {
+		t.Errorf("PXE.AppleIntelRootPath = %q", cfg.Services.PXE.AppleIntelRootPath)
 	}
 	if cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"] != "/tftpboot/img.bin" {
 		t.Errorf("PXE.MacImages expanded = %q, want /tftpboot/img.bin", cfg.Services.PXE.MacImages["aa:bb:cc:dd:ee:ff"])
@@ -212,8 +217,12 @@ func TestApplyExtras(t *testing.T) {
 		MacImages: map[string]string{
 			"AA-BB-CC-DD-EE-FF": "netboot-arm.bin",
 		},
-		DefaultImage: "netboot.xyz.efi",
-		PXEBootFile:  "netboot.xyz.efi",
+		DefaultImage:       "netboot.xyz.efi",
+		PXEBootFile:        "netboot.xyz.efi",
+		AppleNetBoot:       true,
+		AppleIntelBootFile: "macnbi-i386/booter",
+		AppleIntelRootPath: "nfs:192.168.0.10:/export:NetInstall.dmg",
+		AppleImageID:       0x81000042,
 	}
 	cfg.ApplyExtras(extras)
 
@@ -234,6 +243,11 @@ func TestApplyExtras(t *testing.T) {
 	}
 	if cfg.WiFi.DHCP.PXEBootFile != "netboot.xyz.efi" {
 		t.Errorf("WiFi PXEBootFile = %q, want netboot.xyz.efi", cfg.WiFi.DHCP.PXEBootFile)
+	}
+	if !cfg.Services.PXE.AppleNetBoot || cfg.Services.PXE.AppleIntelBootFile != "macnbi-i386/booter" ||
+		cfg.Services.PXE.AppleIntelRootPath != "nfs:192.168.0.10:/export:NetInstall.dmg" ||
+		cfg.Services.PXE.AppleImageID != 0x81000042 {
+		t.Errorf("Apple NetBoot extras not applied: %+v", cfg.Services.PXE)
 	}
 }
 
@@ -353,11 +367,14 @@ func TestExtrasSaveLoad(t *testing.T) {
 	path := filepath.Join(dir, "extras.toml")
 
 	orig := &ExtrasConfig{
-		Reservations: map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
-		MacImages:    map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
-		DefaultImage: "netboot.xyz.efi",
-		PXEBootFile:  "netboot.xyz.efi",
-		SMBUsers:     []SMBUser{{Name: "backup", Password: "secret"}},
+		Reservations:       map[string]string{"aa:bb:cc:dd:ee:ff": "10.0.1.10"},
+		MacImages:          map[string]string{"11:22:33:44:55:66": "ubuntu.efi"},
+		DefaultImage:       "netboot.xyz.efi",
+		PXEBootFile:        "netboot.xyz.efi",
+		AppleNetBoot:       true,
+		AppleIntelRootPath: "nfs:10.0.0.5:/srv:NetInstall.dmg",
+		AppleImageID:       0x81000067,
+		SMBUsers:           []SMBUser{{Name: "backup", Password: "secret"}},
 	}
 	if err := orig.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -381,6 +398,15 @@ func TestExtrasSaveLoad(t *testing.T) {
 	}
 	if len(loaded.SMBUsers) != 1 || loaded.SMBUsers[0].Name != "backup" {
 		t.Errorf("smb users mismatch: %+v", loaded.SMBUsers)
+	}
+	if !loaded.AppleNetBoot {
+		t.Error("appleNetBoot mismatch: want true")
+	}
+	if loaded.AppleIntelRootPath != "nfs:10.0.0.5:/srv:NetInstall.dmg" {
+		t.Errorf("AppleIntelRootPath = %q", loaded.AppleIntelRootPath)
+	}
+	if loaded.AppleImageID != 0x81000067 {
+		t.Errorf("AppleImageID = %#x, want 0x81000067", loaded.AppleImageID)
 	}
 }
 

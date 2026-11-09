@@ -41,3 +41,11 @@ pxeBootFile = "netboot.xyz.efi"
 legacyBootFile = "undionly.kpxe"
 uefiBootFile = "netboot.xyz.efi"
 ipxeScript = "boot.ipxe"
+
+# Apple NetBoot (BSDP). Root-level keys must appear BEFORE the first [table]
+# section above. These replace the services.pxe values from router.json, so
+# absent keys disable the feature. Match appleIntelRootPath to services.nfs:
+# nfs:<router-ip-on-the-client-subnet>:<export-path>:<NetInstall.dmg>.
+appleNetBoot = true
+appleIntelBootFile = "macnbi-i386/booter"
+appleIntelRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall.dmg"

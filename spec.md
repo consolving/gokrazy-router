@@ -132,6 +132,15 @@ Optional PXE boot server:
 - Supports default image and per-MAC image selection
 - DHCP scopes automatically advertise PXE options 66/67 when enabled
 - Selects the boot file by client type: legacy BIOS, UEFI (option 93), or iPXE (option 77)
+- Apple NetBoot (BSDP): answers `AAPLBSDPC/i386` and `AAPLBSDPC/ppc` clients with the BSDP option-43 boot image ID, a `macnbi-<arch>/booter` TFTP boot file and an NFS root-path (option 17)
+
+#### 8b. NFS Server (`pkg/nfs`)
+
+Optional userspace NFSv3 server for the mounted volume:
+
+- Runs external `unfsd` (unfs3) + `rpcbind` binaries bundled via ExtraFilePaths
+- Generates the exports file at startup from `services.nfs` (export path, client ACL, read-only, root squashing)
+- Fixed ports (2049/20048) for stable DHCP root-path references and firewall rules
 
 #### 9. Configuration (`pkg/config`)
 

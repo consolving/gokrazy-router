@@ -22,6 +22,7 @@ import (
 	"github.com/consolving/gokrazy-router/pkg/mount"
 	"github.com/consolving/gokrazy-router/pkg/nat"
 	"github.com/consolving/gokrazy-router/pkg/netsetup"
+	"github.com/consolving/gokrazy-router/pkg/nfs"
 	"github.com/consolving/gokrazy-router/pkg/pxe"
 	"github.com/consolving/gokrazy-router/pkg/smb"
 	"github.com/consolving/gokrazy-router/pkg/status"
@@ -82,8 +83,9 @@ func main() {
 	// mount failure degrade gracefully instead of exiting.
 	if cfg.Services.Mount.Enabled {
 		if err := mount.Mount(cfg.Services.Mount); err != nil {
-			log.Printf("mount: %v (continuing without %s: SMB/PXE/extras disabled)", err, cfg.Services.Mount.Target)
+			log.Printf("mount: %v (continuing without %s: SMB/NFS/PXE/extras disabled)", err, cfg.Services.Mount.Target)
 			cfg.Services.SMB.Enabled = false
+			cfg.Services.NFS.Enabled = false
 			cfg.Services.PXE.Enabled = false
 			cfg.Services.ExtrasFile = ""
 			cfg.Services.Mount.Enabled = false
@@ -111,6 +113,9 @@ func main() {
 	// Derive default service paths from the mount target.
 	if cfg.Services.SMB.Enabled && cfg.Services.SMB.SharePath == "" {
 		cfg.Services.SMB.SharePath = cfg.Services.Mount.Target
+	}
+	if cfg.Services.NFS.Enabled && cfg.Services.NFS.ExportPath == "" {
+		cfg.Services.NFS.ExportPath = filepath.Join(cfg.Services.Mount.Target, "netboot")
 	}
 	if cfg.Services.PXE.Enabled && cfg.Services.PXE.TFTPRoot == "" {
 		cfg.Services.PXE.TFTPRoot = filepath.Join(cfg.Services.Mount.Target, "tftpboot")
@@ -408,6 +413,17 @@ func main() {
 		}
 	}
 
+	// 8b. Start optional NFS server (userspace unfs3 + rpcbind).
+	var nfsServer *nfs.Server
+	if cfg.Services.NFS.Enabled {
+		nfsServer = nfs.New(cfg.Services.NFS)
+		if err := nfsServer.Start(); err != nil {
+			log.Printf("nfs: %v (continuing without NFS)", err)
+		} else {
+			activeServices = append(activeServices, fmt.Sprintf("NFS(%s)", cfg.Services.NFS.ExportPath))
+		}
+	}
+
 	// 9. Start optional PXE/TFTP server.
 	// The listener is left unbound to the local interfaces by default so it can
 	// serve every DHCP scope that advertises option 66/67 (all VLAN bridges and
@@ -423,6 +439,9 @@ func main() {
 			}
 		}()
 		activeServices = append(activeServices, fmt.Sprintf("PXE/TFTP(%s)", cfg.Services.PXE.Listen))
+		if cfg.Services.PXE.AppleNetBoot {
+			activeServices = append(activeServices, "AppleNetBoot")
+		}
 	}
 
 	// 10. Start administration HTTP API.
@@ -741,6 +760,10 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 	// Always replace: an empty map must clear per-MAC overrides removed from
 	// the extras file at runtime.
 	srv.SetMacPXEBootFiles(macImages)
+	// Apple NetBoot (BSDP) rides on the same TFTP root: AAPLBSDPC clients get
+	// macnbi-<arch>/booter via option 67 and the NFS root-path (option 17).
+	srv.SetAppleNetBoot(pxeCfg.AppleNetBoot, pxeCfg.AppleIntelBootFile, pxeCfg.ApplePPCBootFile,
+		pxeCfg.AppleIntelRootPath, pxeCfg.ApplePPCRootPath, pxeCfg.AppleImageID)
 }
 
 func ifaceIPFromCIDR(cidr string) string {
