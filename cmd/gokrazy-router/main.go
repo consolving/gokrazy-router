@@ -672,6 +672,7 @@ func cloneConfig(c *config.Config) *config.Config {
 		out.VLANs[i].DHCP.Reservations = cloneStringMap(c.VLANs[i].DHCP.Reservations)
 	}
 	out.Services.PXE.MacImages = cloneStringMap(c.Services.PXE.MacImages)
+	out.Services.PXE.MacRootPaths = cloneStringMap(c.Services.PXE.MacRootPaths)
 	return &out
 }
 
@@ -760,6 +761,7 @@ func applyPXEBootOptions(srv *dhcp.Server, pxeEnabled bool, tftpServer string, m
 	// Always replace: an empty map must clear per-MAC overrides removed from
 	// the extras file at runtime.
 	srv.SetMacPXEBootFiles(macImages)
+	srv.SetMacRootPaths(pxeCfg.MacRootPaths)
 	// Apple NetBoot (BSDP) rides on the same TFTP root: AAPLBSDPC clients get
 	// macnbi-<arch>/booter via option 67 and the NFS root-path (option 17).
 	srv.SetAppleNetBoot(pxeCfg.AppleNetBoot, pxeCfg.AppleIntelBootFile, pxeCfg.ApplePPCBootFile,

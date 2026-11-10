@@ -52,3 +52,8 @@ appleIntelRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall-i386.dmg"
 # PowerPC (G4/G5) images: ppc/* -> tftpboot/macnbi-ppc/, dmg -> netboot/NetInstall-ppc.dmg
 applePPCBootFile = "macnbi-ppc/booter"
 applePPCRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall-ppc.dmg"
+
+# Per-client image selection (overrides the per-arch root paths above; also
+# works for non-Apple clients). Example:
+# [macRootPaths]
+# "00:0d:93:aa:bb:cc" = "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.4-NetInstall-ppc.dmg"

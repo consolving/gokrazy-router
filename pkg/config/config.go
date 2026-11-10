@@ -148,6 +148,7 @@ type PXEConfig struct {
 	TFTPRoot       string            `json:"tftpRoot,omitempty"`       // directory containing boot images
 	DefaultImage   string            `json:"defaultImage,omitempty"`   // filename used when MAC is unknown
 	MacImages      map[string]string `json:"macImages,omitempty"`      // MAC (lower case) -> filename
+	MacRootPaths   map[string]string `json:"macRootPaths,omitempty"`   // MAC (lower case) -> NFS root-path (option 17), overrides per-arch default
 	BootFile       string            `json:"bootFile,omitempty"`       // default option 67 bootfile
 	LegacyBootFile string            `json:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
 	UEFIBootFile   string            `json:"uefiBootFile,omitempty"`   // option 67 for UEFI PXE clients
@@ -168,6 +169,7 @@ type PXEConfig struct {
 type ExtrasConfig struct {
 	Reservations   map[string]string `toml:"reservations"`             // MAC -> IP
 	MacImages      map[string]string `toml:"macImages"`                // MAC -> PXE image filename
+	MacRootPaths   map[string]string `toml:"macRootPaths,omitempty"`   // MAC -> NFS root-path (option 17), overrides per-arch default
 	DefaultImage   string            `toml:"defaultImage"`             // PXE default image (overrides router.json)
 	PXEBootFile    string            `toml:"pxeBootFile"`              // DHCP option 67 bootfile (applied to all subnets)
 	LegacyBootFile string            `toml:"legacyBootFile,omitempty"` // option 67 for legacy BIOS PXE clients
@@ -334,6 +336,9 @@ func (c *Config) ExpandEnv() {
 	for k, v := range c.Services.PXE.MacImages {
 		c.Services.PXE.MacImages[k] = e(v)
 	}
+	for k, v := range c.Services.PXE.MacRootPaths {
+		c.Services.PXE.MacRootPaths[k] = e(v)
+	}
 
 	c.Services.ExtrasFile = e(c.Services.ExtrasFile)
 	c.Services.AdminAPI.Listen = e(c.Services.AdminAPI.Listen)
@@ -377,6 +382,7 @@ func (c *Config) ApplyExtras(extras *ExtrasConfig) {
 	// created extras file (see ExtrasFromConfig) is seeded from router.json,
 	// so nothing is lost unless the file is edited.
 	c.Services.PXE.MacImages = cloneStringMap(extras.MacImages)
+	c.Services.PXE.MacRootPaths = cloneStringMap(extras.MacRootPaths)
 	c.Services.PXE.DefaultImage = extras.DefaultImage
 	c.Services.PXE.LegacyBootFile = extras.LegacyBootFile
 	c.Services.PXE.UEFIBootFile = extras.UEFIBootFile
@@ -432,6 +438,10 @@ func ExtrasFromConfig(c *Config) *ExtrasConfig {
 	e.MacImages = make(map[string]string)
 	for mac, img := range c.Services.PXE.MacImages {
 		e.MacImages[mac] = img
+	}
+	e.MacRootPaths = make(map[string]string)
+	for mac, path := range c.Services.PXE.MacRootPaths {
+		e.MacRootPaths[mac] = path
 	}
 	e.DefaultImage = c.Services.PXE.DefaultImage
 	e.PXEBootFile = c.Services.PXE.BootFile

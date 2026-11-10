@@ -42,6 +42,7 @@ type Server struct {
 	pxeBootServer   net.IP
 	pxeBootFile     string
 	macPXEBootFiles map[string]string // normalized MAC -> bootfile (DHCP option 67)
+	macRootPaths    map[string]string // normalized MAC -> NFS root-path (DHCP option 17)
 	ipxeBootFile    string            // bootfile for clients that already run iPXE
 	uefiBootFile    string            // bootfile for UEFI PXE clients
 	legacyBootFile  string            // bootfile for legacy BIOS PXE clients
@@ -180,6 +181,20 @@ func (s *Server) SetMacPXEBootFiles(m map[string]string) {
 	s.macPXEBootFiles = make(map[string]string, len(m))
 	for mac, file := range m {
 		s.macPXEBootFiles[normalizeMAC(mac)] = file
+	}
+}
+
+// SetMacRootPaths replaces the per-client DHCP option 17 root-path map.
+// Entries override the Apple NetBoot per-architecture root paths; a non-Apple
+// client with an entry also gets the root path (explicit admin intent, e.g.
+// an NFS-rooted Linux PXE client). Always replaces: an empty map clears
+// entries removed from the extras file at runtime.
+func (s *Server) SetMacRootPaths(m map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.macRootPaths = make(map[string]string, len(m))
+	for mac, path := range m {
+		s.macRootPaths[normalizeMAC(mac)] = path
 	}
 }
 
@@ -492,6 +507,7 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		bootServer := s.pxeBootServer
 		bootFile := s.pxeBootFile
 		macFile, hasMacFile := s.macPXEBootFiles[normalizeMAC(mac)]
+		macRoot, hasMacRoot := s.macRootPaths[normalizeMAC(mac)]
 		ipxe := s.ipxeBootFile
 		uefi := s.uefiBootFile
 		legacy := s.legacyBootFile
@@ -499,7 +515,7 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		s.mu.Unlock()
 
 		classified := ""
-		var appleRootPath string
+		var rootPath string
 		var appleImageID uint32
 		switch {
 		case ipxe != "" && req != nil && isIPXEClient(req):
@@ -514,12 +530,12 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			switch appleVendorArch(req) {
 			case "i386":
 				bootFile = apple.IntelBootFile
-				appleRootPath = apple.IntelRootPath
+				rootPath = apple.IntelRootPath
 				appleImageID = apple.IntelImageID
 				classified = "apple-i386"
 			case "ppc":
 				bootFile = apple.PPCBootFile
-				appleRootPath = apple.PPCRootPath
+				rootPath = apple.PPCRootPath
 				appleImageID = apple.PPCImageID
 				classified = "apple-ppc"
 			}
@@ -539,15 +555,22 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			log.Printf("dhcp: %s selected %s bootfile=%s", mac, classified, bootFile)
 			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
 		}
-		if classified == "apple-i386" || classified == "apple-ppc" {
-			// BSDP payload per the reference recipe: root path (option 17) on
-			// every reply, vendor class echo (option 60) and the selected boot
-			// image ID in vendor-encapsulated options (option 43) with
-			// per-message-type rules.
-			if appleRootPath != "" {
-				log.Printf("dhcp: %s sending option 17 root-path=%s", mac, appleRootPath)
-				d.UpdateOption(dhcpv4.OptRootPath(appleRootPath))
+		// Per-MAC root paths override the Apple per-architecture default and
+		// also apply to non-Apple clients (explicit admin intent).
+		if hasMacRoot {
+			if rootPath != macRoot {
+				log.Printf("dhcp: %s per-MAC root-path override=%s", mac, macRoot)
 			}
+			rootPath = macRoot
+		}
+		if rootPath != "" {
+			log.Printf("dhcp: %s sending option 17 root-path=%s", mac, rootPath)
+			d.UpdateOption(dhcpv4.OptRootPath(rootPath))
+		}
+		if classified == "apple-i386" || classified == "apple-ppc" {
+			// BSDP option 43 per the reference recipe: the selected boot
+			// image ID with per-message-type rules. Root path (option 17)
+			// was already emitted above.
 			if req == nil {
 				return
 			}

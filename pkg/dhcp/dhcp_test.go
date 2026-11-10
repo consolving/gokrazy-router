@@ -623,3 +623,66 @@ func TestBSDPSelectImagePayload(t *testing.T) {
 		t.Errorf("bsdpSelectImage = % x", got)
 	}
 }
+
+func TestMacRootPathOverride(t *testing.T) {
+	s := appleTestServer()
+
+	// Per-MAC root path overrides the PPC arch default; bootfile and BSDP
+	// payload stay intact.
+	s.SetMacRootPaths(map[string]string{
+		"aa:bb:cc:dd:ee:ff": "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.4-ppc.dmg",
+	})
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/ppc"))
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.4-ppc.dmg" {
+		t.Errorf("overridden root-path = %q", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("bootfile = %q, want arch default", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+		t.Errorf("option 43 = % x", got)
+	}
+
+	// A client without an entry keeps the arch default.
+	other := appleTestServer() // fresh server, no MAC entry
+	other.SetMacRootPaths(map[string]string{
+		"11:22:33:44:55:66": "nfs:10.0.31.1:/mnt/sata/netboot:Other.dmg",
+	})
+	resp = appleReply(t, other, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/ppc"))
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
+		t.Errorf("non-mapped client root-path = %q, want arch default", got)
+	}
+}
+
+func TestMacRootPathNonApple(t *testing.T) {
+	s := appleTestServer()
+	s.SetMacRootPaths(map[string]string{
+		"aa:bb:cc:dd:ee:ff": "nfs:10.0.31.1:/mnt/sata/netboot:LinuxRoot.dmg",
+	})
+
+	// A legacy PXE client with an explicit entry gets option 17 (NFS-rooted
+	// Linux) but no BSDP payload.
+	resp := appleReply(t, s, func() *dhcpv4.DHCPv4 {
+		req, err := dhcpv4.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}())
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:10.0.31.1:/mnt/sata/netboot:LinuxRoot.dmg" {
+		t.Errorf("legacy client root-path = %q", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "undionly.kpxe" {
+		t.Errorf("legacy client bootfile = %q, want undionly.kpxe", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); got != nil {
+		t.Errorf("legacy client option 43 = % x, want none", got)
+	}
+
+	// Replacing with an empty map clears entries.
+	s.SetMacRootPaths(nil)
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
+		t.Errorf("root-path after clear = %q, want arch default", got)
+	}
+}

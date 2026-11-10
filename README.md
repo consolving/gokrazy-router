@@ -428,6 +428,20 @@ Notes:
 - The PPC DHCP flow uses the fallback option-43 payload on REQUEST (static `00:01:02:…:07` bytes) exactly as the reference recipe does; this is what the recipe validated against 10.5-era clients.
 - The 10.5 installer wants ≥512 MB RAM and a DVD-quality network path — NFS over the built-in server is plenty.
 
+##### Selecting images per client (per-MAC root paths)
+
+`applePPCRootPath`/`appleIntelRootPath` are per-architecture defaults. To serve **different images of the same architecture to different clients at the same time**, map client MACs to root paths via `[macRootPaths]` (extras TOML) or `services.pxe.macRootPaths` (router.json):
+
+```toml
+[macRootPaths]
+"00:0d:93:aa:bb:cc" = "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.4-NetInstall-ppc.dmg"
+"00:0e:xx:yy:zz:zz" = "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.4-Tiger-ppc.dmg"
+```
+
+- Precedence: per-MAC entry > architecture default. Entries also apply to non-Apple clients (e.g. an NFS-rooted Linux PXE box) — those get option 17 without any BSDP payload.
+- The TFTP boot file can be overridden per client independently via `[macImages]` — useful when different images ship different booters (keep one TFTP directory per image, e.g. `macnbi-ppc-1054/`).
+- Extras are re-read on `/api/reload`; per-MAC entries take effect without a restart. Removing all entries falls back to the arch defaults.
+
 ### Static DHCP reservations
 
 Reserve fixed IPs by MAC address in any `dhcp` block:
@@ -459,7 +473,8 @@ Supported keys:
 | Key | Purpose |
 |-----|---------|
 | `[reservations]` | `"mac" = "ip"` fixed leases, merged into every DHCP scope (VLANs, LAN, WiFi) |
-| `[macImages]` | `"mac" = "file"` per-MAC TFTP image (DHCP boot-file precedence: iPXE > per-MAC > UEFI/legacy) |
+| `[macImages]` | `"mac" = "file"` per-MAC TFTP image (DHCP boot-file precedence: iPXE > per-MAC > Apple > UEFI/legacy) |
+| `[macRootPaths]` | `"mac" = "nfs:…"` per-MAC NFS root-path (option 17); overrides the per-arch Apple default, also applies to non-Apple clients |
 | `defaultImage` | TFTP fallback for per-MAC requests that have no `macImages` entry |
 | `pxeBootFile` | DHCP option 67 boot file (applied to all subnets) |
 | `legacyBootFile` | Option 67 for legacy BIOS PXE clients |
