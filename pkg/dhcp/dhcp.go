@@ -399,6 +399,21 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 			opts,
 		)
 		log.Printf("dhcp: ACK %s -> %s", mac, ip)
+	case dhcpv4.MessageTypeInform:
+		// RFC 2131 DHCPINFORM: the client already has an address and asks
+		// for remaining configuration. Answer with an ACK carrying the
+		// scope options and the per-client boot config (bootfile, root-path,
+		// BSDP payload) — no lease, no yiaddr. Apple's PPC booter sends
+		// INFORM after its lease and waits for the reply before TFTP.
+		resp, err = dhcpv4.NewReplyFromRequest(req,
+			dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
+			dhcpv4.WithServerIP(s.serverIP),
+			dhcpv4.WithOption(dhcpv4.OptSubnetMask(s.mask)),
+			dhcpv4.WithOption(dhcpv4.OptDNS(s.dns...)),
+			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(s.serverIP)),
+			opts,
+		)
+		log.Printf("dhcp: INFORM %s -> ACK (config only)", mac)
 	default:
 		return
 	}
@@ -581,9 +596,16 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			case classified == "apple-ppc" && req.MessageType() == dhcpv4.MessageTypeDiscover:
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(appleImageID)))
+			case classified == "apple-ppc" && req.MessageType() == dhcpv4.MessageTypeInform:
+				// Reference recipe ppc INFORM payload: BSDP message type 2
+				// (offer/ack) followed by the selected boot image ID.
+				inform := append([]byte{0x01, 0x01, 0x02}, bsdpSelectImage(appleImageID)...)
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, inform))
 			case classified == "apple-ppc":
 				// The ppc class in the reference recipe answers any message
-				// type other than DISCOVER with the static fallback payload.
+				// type other than DISCOVER/INFORM with the static fallback
+				// payload.
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation,
 					[]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}))

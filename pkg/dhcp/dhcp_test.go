@@ -686,3 +686,44 @@ func TestMacRootPathNonApple(t *testing.T) {
 		t.Errorf("root-path after clear = %q, want arch default", got)
 	}
 }
+
+func TestAppleNetBootInform(t *testing.T) {
+	s := appleTestServer()
+
+	// The PPC booter sends DHCPINFORM after its lease and waits for the
+	// reply (with the BSDP INFORM payload) before TFTP-loading the kernel.
+	// (The message type itself is set by the handler, not replyOptions.)
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/ppc"))
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("INFORM bootfile = %q, want macnbi-ppc/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
+		t.Errorf("INFORM root-path = %q", got)
+	}
+	want := append([]byte{0x01, 0x01, 0x02}, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}...)
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, want) {
+		t.Errorf("INFORM option 43 = % x, want 01 01 02 08 04 81 00 00 09", got)
+	}
+	// INFORM replies must not hand out a lease.
+	if got := resp.Options.Get(dhcpv4.OptionIPAddressLeaseTime); got != nil {
+		t.Errorf("INFORM reply carries lease time: % x", got)
+	}
+
+	// i386: the reference recipe defines no INFORM payload — option 43 absent.
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/i386"))
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
+		t.Errorf("i386 INFORM root-path = %q", got)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); got != nil {
+		t.Errorf("i386 INFORM option 43 = % x, want none", got)
+	}
+
+	// Per-MAC root-path override also applies on INFORM.
+	s.SetMacRootPaths(map[string]string{
+		"aa:bb:cc:dd:ee:ff": "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.8-NetBoot-ppc.dmg",
+	})
+	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/ppc"))
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.8-NetBoot-ppc.dmg" {
+		t.Errorf("INFORM per-MAC root-path = %q", got)
+	}
+}
