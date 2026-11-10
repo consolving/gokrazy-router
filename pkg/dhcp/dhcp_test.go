@@ -515,7 +515,7 @@ func TestAppleNetBootIntel(t *testing.T) {
 	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
 		t.Errorf("i386 root-path = %q", got)
 	}
-	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x67}) {
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x10, 0x00}) {
 		t.Errorf("i386 option 43 = % x, want 08 04 81 00 00 67", got)
 	}
 	if got := string(resp.Options.Get(dhcpv4.OptionClassIdentifier)); got != "AAPLBSDPC/i386" {
@@ -551,7 +551,7 @@ func TestAppleNetBootPPC(t *testing.T) {
 	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
 		t.Errorf("ppc root-path = %q", got)
 	}
-	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x10, 0x00}) {
 		t.Errorf("ppc option 43 = % x, want 08 04 81 00 00 09", got)
 	}
 	if got := string(resp.Options.Get(dhcpv4.OptionClassIdentifier)); got != "AAPLBSDPC/ppc" {
@@ -616,10 +616,10 @@ func TestAppleNetBootDisabledAndPrecedence(t *testing.T) {
 }
 
 func TestBSDPSelectImagePayload(t *testing.T) {
-	if got := bsdpSelectImage(0x81000067); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x67}) {
+	if got := bsdpSelectImage(0x81001000); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x10, 0x00}) {
 		t.Errorf("bsdpSelectImage = % x", got)
 	}
-	if got := bsdpSelectImage(0x81000009); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+	if got := bsdpSelectImage(0x01001000); !bytes.Equal(got, []byte{0x08, 0x04, 0x01, 0x00, 0x10, 0x00}) {
 		t.Errorf("bsdpSelectImage = % x", got)
 	}
 }
@@ -639,7 +639,7 @@ func TestMacRootPathOverride(t *testing.T) {
 	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
 		t.Errorf("bootfile = %q, want arch default", got)
 	}
-	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}) {
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x08, 0x04, 0x81, 0x00, 0x10, 0x00}) {
 		t.Errorf("option 43 = % x", got)
 	}
 
@@ -690,40 +690,111 @@ func TestMacRootPathNonApple(t *testing.T) {
 func TestAppleNetBootInform(t *testing.T) {
 	s := appleTestServer()
 
-	// The PPC booter sends DHCPINFORM after its lease and waits for the
-	// reply (with the BSDP INFORM payload) before TFTP-loading the kernel.
-	// (The message type itself is set by the handler, not replyOptions.)
-	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/ppc"))
+	// INFORM[LIST] (NetBoot 2.0 client, BSDP version 0x0101): the reply must
+	// carry msg type LIST, the version, server identifier, a default boot
+	// image and the boot image list with one entry derived from the root path.
+	listReq, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeInform),
+		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte("AAPLBSDPC/ppc")),
+		dhcpv4.WithGeneric(dhcpv4.OptionVendorSpecificInformation, []byte{
+			0x01, 0x01, 0x01, // msg type LIST
+			0x02, 0x02, 0x01, 0x01, // version 1.1
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := appleReply(t, s, listReq)
 	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
-		t.Errorf("INFORM bootfile = %q, want macnbi-ppc/booter", got)
+		t.Errorf("LIST bootfile = %q, want macnbi-ppc/booter", got)
 	}
 	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
-		t.Errorf("INFORM root-path = %q", got)
+		t.Errorf("LIST root-path = %q", got)
 	}
-	want := append([]byte{0x01, 0x01, 0x02}, []byte{0x08, 0x04, 0x81, 0x00, 0x00, 0x09}...)
-	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, want) {
-		t.Errorf("INFORM option 43 = % x, want 01 01 02 08 04 81 00 00 09", got)
+	want43 := []byte{
+		0x01, 0x01, 0x01, // msg type LIST
+		0x02, 0x02, 0x01, 0x01, // version 1.1
+		0x03, 0x04, 10, 0, 0, 1, // server identifier 10.0.0.1
+		0x04, 0x02, 0x03, 0xe8, // priority 1000
+		0x07, 0x04, 0x81, 0x00, 0x10, 0x00, // default boot image
+		0x09, 0x0f, 0x81, 0x00, 0x10, 0x00, 0x0a, 'N', 'e', 't', 'I', 'n', 's', 't', 'a', 'l', 'l', // list entry
 	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, want43) {
+		t.Errorf("LIST option 43 = % x, want % x", got, want43)
+	}
+
+	// INFORM[SELECT]: the server confirms the client's selected boot image.
+	selectReq, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeInform),
+		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte("AAPLBSDPC/ppc")),
+		dhcpv4.WithGeneric(dhcpv4.OptionVendorSpecificInformation, []byte{
+			0x01, 0x01, 0x02, // msg type SELECT
+			0x02, 0x02, 0x01, 0x01, // version 1.1
+			0x08, 0x04, 0x81, 0x10, 0x00, 0x00, // selected boot image
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = appleReply(t, s, selectReq)
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("SELECT bootfile = %q, want macnbi-ppc/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-ppc.dmg" {
+		t.Errorf("SELECT root-path = %q", got)
+	}
+	want43 = []byte{
+		0x01, 0x01, 0x02, // msg type SELECT
+		0x02, 0x02, 0x01, 0x01, // version 1.1
+		0x08, 0x04, 0x81, 0x10, 0x00, 0x00, // selected boot image (echoed)
+	}
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, want43) {
+		t.Errorf("SELECT option 43 = % x, want % x", got, want43)
+	}
+
+	// Unparseable option 43 on an INFORM: old-style ppc payload (recipe).
+	oldReq, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeInform),
+		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte("AAPLBSDPC/ppc")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = appleReply(t, s, oldReq)
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, append([]byte{0x01, 0x01, 0x02}, []byte{0x08, 0x04, 0x81, 0x00, 0x10, 0x00}...)) {
+		t.Errorf("old-style INFORM option 43 = % x", got)
+	}
+
 	// INFORM replies must not hand out a lease.
 	if got := resp.Options.Get(dhcpv4.OptionIPAddressLeaseTime); got != nil {
 		t.Errorf("INFORM reply carries lease time: % x", got)
 	}
 
-	// i386: the reference recipe defines no INFORM payload — option 43 absent.
-	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/i386"))
-	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:192.168.0.10:/export:NetInstall-i386.dmg" {
-		t.Errorf("i386 INFORM root-path = %q", got)
+	// i386: recipe defines no INFORM payload for unparseable 43 — none.
+	i386Req, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeInform),
+		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte("AAPLBSDPC/i386")),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
+	resp = appleReply(t, s, i386Req)
 	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); got != nil {
 		t.Errorf("i386 INFORM option 43 = % x, want none", got)
 	}
 
-	// Per-MAC root-path override also applies on INFORM.
+	// Per-MAC root-path override applies on INFORM and feeds the list entry.
 	s.SetMacRootPaths(map[string]string{
 		"aa:bb:cc:dd:ee:ff": "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.8-NetBoot-ppc.dmg",
 	})
-	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeInform, "AAPLBSDPC/ppc"))
+	resp = appleReply(t, s, listReq)
 	if got := string(resp.Options.Get(dhcpv4.OptionRootPath)); got != "nfs:10.0.31.1:/mnt/sata/netboot:MacOSX-10.5.8-NetBoot-ppc.dmg" {
-		t.Errorf("INFORM per-MAC root-path = %q", got)
+		t.Errorf("LIST per-MAC root-path = %q", got)
+	}
+	got43 := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation)
+	// NetBoot-style dmg -> non-install attributes 0x01; name from the dmg.
+	if !bytes.Contains(got43, []byte{0x09, 0x1a, 0x01, 0x00, 0x10, 0x00, 0x15}) ||
+		!bytes.Contains(got43, []byte("MacOSX-10.5.8-NetBoot")) {
+		t.Errorf("LIST per-MAC option 43 = % x, want entry 01 10 00 00 + MacOSX-10.5.8-NetBoot", got43)
 	}
 }

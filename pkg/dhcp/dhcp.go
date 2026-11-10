@@ -65,22 +65,38 @@ type appleNetBootConfig struct {
 }
 
 // BSDP constants from the reference recipe for ISC dhcpd ("Mac OS X Maschine
-// über Netzwerk booten", kb.pocnet.net): Apple clients are matched by the
-// AAPLBSDPC vendor class and answered with the selected boot image ID inside
-// vendor-encapsulated options (DHCP option 43, BSDP sub-option 8).
+// über Netzwerk booten", kb.pocnet.net) plus the Apple BSDP specification
+// (bootp-170 Documentation/BSDP.doc, NetBoot 2.0 / version 0x0101): Apple
+// clients are matched by the AAPLBSDPC vendor class and answered with
+// vendor-encapsulated options carrying the boot image list (ACK[LIST]) and
+// the selected boot image (ACK[SELECT]).
 const (
 	appleVendorClass = "AAPLBSDPC"
 
-	bsdpSubOptionSelectedImage = 8
+	// BSDP option 43 sub-option codes (Apple BSDP spec 3.4).
+	bsdpSubOptionMessage    = 1 // 1=LIST, 2=SELECT, 3=FAILED
+	bsdpSubOptionVersion    = 2 // uint16 0x0101 for NetBoot 2.0
+	bsdpSubOptionServerID   = 3 // ipaddr
+	bsdpSubOptionPriority   = 4 // uint16
+	bsdpSubOptionDefaultID  = 7 // boot_image_id
+	bsdpSubOptionSelectedID = 8 // boot_image_id
+	bsdpSubOptionImageList  = 9 // entries: 4-byte ID + 1-byte count + name
 
-	// Default BSDP boot image IDs used when no explicit image ID is
-	// configured. The 0x81000000 flag marks a bootable network disk image.
-	appleIntelDefaultImageID = 0x81000067
-	applePPCDefaultImageID   = 0x81000009
+	bsdpMsgTypeList   = 1
+	bsdpMsgTypeSelect = 2
+
+	// BSDP boot_image_id attributes (byte 0): bit 7 = Install, bits 0-6 =
+	// Kind (0x01 = Mac OS X). Index (bytes 1-2) 0x1000+ = globally unique.
+	bsdpAttrInstall = 0x80
+	bsdpKindMacOSX  = 0x01
+	bsdpIndexBase   = 0x1000
 
 	appleIntelVendorClass = appleVendorClass + "/i386"
 	applePPCVendorClass   = appleVendorClass + "/ppc"
 )
+
+// bsdpVersion0101 is the BSDP protocol version of NetBoot 2.0 clients.
+var bsdpVersion0101 = [2]byte{0x01, 0x01}
 
 type lease struct {
 	IP      net.IP
@@ -234,10 +250,10 @@ func (s *Server) SetAppleNetBoot(enabled bool, intelBootFile, ppcBootFile, intel
 	}
 	intelID, ppcID := imageID, imageID
 	if intelID == 0 {
-		intelID = appleIntelDefaultImageID
+		intelID = 0 // 0 = derive a spec-shaped ID from the root path
 	}
 	if ppcID == 0 {
-		ppcID = applePPCDefaultImageID
+		ppcID = 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -527,6 +543,7 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		uefi := s.uefiBootFile
 		legacy := s.legacyBootFile
 		apple := s.appleNetBoot
+		serverIP := s.serverIP
 		s.mu.Unlock()
 
 		classified := ""
@@ -583,35 +600,161 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			d.UpdateOption(dhcpv4.OptRootPath(rootPath))
 		}
 		if classified == "apple-i386" || classified == "apple-ppc" {
-			// BSDP option 43 per the reference recipe: the selected boot
-			// image ID with per-message-type rules. Root path (option 17)
-			// was already emitted above.
+			// BSDP option 43 payloads. Apple BSDP spec (bootp-170
+			// Documentation/BSDP.doc): NetBoot 2.0 clients (version 0x0101)
+			// ask via INFORM[LIST] / INFORM[SELECT] and expect the boot
+			// image list resp. the selected boot image; the DISCOVER path
+			// stays recipe-style for NetBoot 1.0 clients.
 			if req == nil {
 				return
 			}
+			imageID := appleImageID
+			if imageID == 0 {
+				imageID = bsdpImageIDForRootPath(rootPath)
+			}
+			class := []byte(applePPCVendorClass)
+			if classified == "apple-i386" {
+				class = []byte(appleIntelVendorClass)
+			}
 			switch {
-			case classified == "apple-i386" && req.MessageType() == dhcpv4.MessageTypeDiscover:
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(appleIntelVendorClass)))
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(appleImageID)))
-			case classified == "apple-ppc" && req.MessageType() == dhcpv4.MessageTypeDiscover:
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(appleImageID)))
+			case req.MessageType() == dhcpv4.MessageTypeDiscover:
+				// Recipe-style OFFER*: selected boot image ID.
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(imageID)))
+			case bsdpClientMessageType(req) == bsdpMsgTypeList:
+				// INFORM[LIST] -> ACK[LIST]: version, server identifier,
+				// priority, default boot image and the boot image list.
+				var payload []byte
+				payload = append(payload, bsdpSubOptionMessage, 1, bsdpMsgTypeList)
+				payload = append(payload, bsdpSubOptionVersion, 2)
+				payload = append(payload, bsdpVersion0101[:]...)
+				payload = append(payload, bsdpSubOptionServerID, 4)
+				payload = append(payload, serverIP.To4()...)
+				payload = append(payload, bsdpSubOptionPriority, 2, 0x03, 0xe8)
+				payload = append(payload, bsdpSubOptionDefaultID, 4)
+				payload = append(payload, byte(imageID>>24), byte(imageID>>16), byte(imageID>>8), byte(imageID))
+				entry := bsdpImageListEntry(imageID, bsdpImageNameForRootPath(rootPath))
+				payload = append(payload, bsdpSubOptionImageList, byte(len(entry)))
+				payload = append(payload, entry...)
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, payload))
+			case bsdpClientMessageType(req) == bsdpMsgTypeSelect:
+				// INFORM[SELECT] -> ACK[SELECT]: confirm the client's
+				// selected boot image.
+				selected := bsdpClientSelectedImage(req)
+				if selected == 0 {
+					selected = imageID
+				}
+				var payload []byte
+				payload = append(payload, bsdpSubOptionMessage, 1, bsdpMsgTypeSelect)
+				payload = append(payload, bsdpSubOptionVersion, 2)
+				payload = append(payload, bsdpVersion0101[:]...)
+				payload = append(payload, bsdpSubOptionSelectedID, 4)
+				payload = append(payload, byte(selected>>24), byte(selected>>16), byte(selected>>8), byte(selected))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, payload))
 			case classified == "apple-ppc" && req.MessageType() == dhcpv4.MessageTypeInform:
-				// Reference recipe ppc INFORM payload: BSDP message type 2
-				// (offer/ack) followed by the selected boot image ID.
-				inform := append([]byte{0x01, 0x01, 0x02}, bsdpSelectImage(appleImageID)...)
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
+				// Reference recipe ppc INFORM payload for NetBoot 1.0
+				// clients: BSDP message type 2 + selected boot image ID.
+				inform := append([]byte{0x01, 0x01, 0x02}, bsdpSelectImage(imageID)...)
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, inform))
 			case classified == "apple-ppc":
 				// The ppc class in the reference recipe answers any message
 				// type other than DISCOVER/INFORM with the static fallback
 				// payload.
-				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, []byte(applePPCVendorClass)))
+				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation,
 					[]byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}))
 			}
 		}
 	}
+}
+
+// bsdpParse splits a vendor-encapsulated options blob into BSDP sub-options.
+// Returns nil for empty or malformed input.
+func bsdpParse(b []byte) map[uint8][]byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make(map[uint8][]byte)
+	for len(b) >= 2 {
+		code, l := b[0], int(b[1])
+		if code == 0 || 2+l > len(b) {
+			break
+		}
+		out[code] = append([]byte(nil), b[2:2+l]...)
+		b = b[2+l:]
+	}
+	return out
+}
+
+// bsdpClientMessageType extracts the BSDP message type (sub-option 1: 1=LIST,
+// 2=SELECT) from the client's request; 0 when absent or unparseable.
+func bsdpClientMessageType(req *dhcpv4.DHCPv4) uint8 {
+	m := bsdpParse(req.Options.Get(dhcpv4.OptionVendorSpecificInformation))
+	if mt, ok := m[bsdpSubOptionMessage]; ok && len(mt) == 1 {
+		return mt[0]
+	}
+	return 0
+}
+
+// bsdpClientSelectedImage extracts the client's BSDP Selected Boot Image ID
+// (sub-option 8); 0 when absent.
+func bsdpClientSelectedImage(req *dhcpv4.DHCPv4) uint32 {
+	m := bsdpParse(req.Options.Get(dhcpv4.OptionVendorSpecificInformation))
+	if id, ok := m[bsdpSubOptionSelectedID]; ok && len(id) == 4 {
+		return binary.BigEndian.Uint32(id)
+	}
+	return 0
+}
+
+// bsdpImageIDForRootPath derives a spec-shaped boot_image_id from the root
+// path (attributes byte 0x81 = Install + Kind Mac OS X for NetInstall-style
+// paths, 0x01 = Mac OS X non-install for NetBoot-style paths; index 0x1000 =
+// globally unique range). An explicitly configured ID wins (see replyOptions).
+func bsdpImageIDForRootPath(rootPath string) uint32 {
+	attr := uint32(bsdpAttrInstall | bsdpKindMacOSX)
+	if strings.Contains(strings.ToLower(bsdpImageFile(rootPath)), "netboot") {
+		attr = uint32(bsdpKindMacOSX)
+	}
+	return attr<<24 | bsdpIndexBase
+}
+
+// bsdpImageFile returns the file name component of an NFS root path
+// ("nfs:host:/export:file.dmg" -> "file.dmg").
+func bsdpImageFile(rootPath string) string {
+	if i := strings.LastIndex(rootPath, ":"); i >= 0 {
+		return rootPath[i+1:]
+	}
+	return rootPath
+}
+
+// bsdpImageNameForRootPath derives the boot image name shown in the client's
+// boot picker from the root path's .dmg basename, e.g.
+// "nfs:…:MacOSX-10.5.8-NetBoot-ppc.dmg" -> "MacOSX-10.5.8-NetBoot".
+func bsdpImageNameForRootPath(rootPath string) string {
+	file := rootPath
+	if i := strings.LastIndex(rootPath, ":"); i >= 0 {
+		file = rootPath[i+1:]
+	}
+	name := strings.TrimSuffix(file, ".dmg")
+	for _, suffix := range []string{"-ppc", "-i386", "-x86_64"} {
+		name = strings.TrimSuffix(name, suffix)
+	}
+	if name == "" {
+		name = "NetBoot image"
+	}
+	return name
+}
+
+// bsdpImageListEntry encodes one Boot Image List (sub-option 9) entry:
+// 4-byte boot_image_id, 1-byte name count, name bytes.
+func bsdpImageListEntry(id uint32, name string) []byte {
+	entry := make([]byte, 0, 5+len(name))
+	entry = append(entry, byte(id>>24), byte(id>>16), byte(id>>8), byte(id), byte(len(name)))
+	entry = append(entry, name...)
+	return entry
 }
 
 // isAppleBSDPClient reports whether the request carries the Apple NetBoot
@@ -636,7 +779,7 @@ func appleVendorArch(req *dhcpv4.DHCPv4) string {
 // sub-option 8 with a 4-byte big-endian boot image ID.
 func bsdpSelectImage(id uint32) []byte {
 	b := make([]byte, 6)
-	b[0] = bsdpSubOptionSelectedImage
+	b[0] = bsdpSubOptionSelectedID
 	b[1] = 4
 	binary.BigEndian.PutUint32(b[2:6], id)
 	return b
