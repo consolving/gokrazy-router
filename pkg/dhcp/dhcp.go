@@ -81,6 +81,7 @@ const (
 	bsdpSubOptionDefaultID  = 7 // boot_image_id
 	bsdpSubOptionSelectedID = 8 // boot_image_id
 	bsdpSubOptionImageList  = 9 // entries: 4-byte ID + 1-byte count + name
+	bsdpSubOptionReplyPort  = 5 // uint16: reply to this port instead of 68
 
 	bsdpMsgTypeList   = 1
 	bsdpMsgTypeSelect = 2
@@ -452,6 +453,13 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4)
 		if upeer.IP == nil || upeer.IP.To4().Equal(net.IPv4zero) {
 			dst = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
 		}
+		// BSDP Reply Port (vendor option 43, sub-option 5): the client asks
+		// for the reply on a different port than 68 — the Option-key boot
+		// picker and the Startup Disk panel use a randomized port. Without
+		// this the client never sees the ACK[LIST]/ACK[SELECT].
+		if rp := bsdpReplyPort(req); rp > 0 {
+			dst = &net.UDPAddr{IP: upeer.IP, Port: rp}
+		}
 	}
 
 	if _, err := conn.WriteTo(resp.ToBytes(), dst); err != nil {
@@ -550,7 +558,6 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		uefi := s.uefiBootFile
 		legacy := s.legacyBootFile
 		apple := s.appleNetBoot
-		serverIP := s.serverIP
 		s.mu.Unlock()
 
 		classified := ""
@@ -631,7 +638,6 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 				class = []byte(appleIntelVendorClass)
 			}
 			clientMsg := bsdpClientMessageType(req)
-			clientVer := bsdpClientVersion(req)
 			selectPayload := func() []byte {
 				// BSDP msg type 2 (SELECT) + the boot image ID — the
 				// recipe's ppc INFORM/ACK payload, spec-shaped.
@@ -642,16 +648,13 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 				// Recipe-style OFFER*: selected boot image ID.
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, bsdpSelectImage(imageID)))
-			case req.MessageType() == dhcpv4.MessageTypeInform && clientVer >= 0x0101 && clientMsg == bsdpMsgTypeList:
-				// INFORM[LIST] -> ACK[LIST]: version, server identifier,
-				// priority, default boot image and the boot image list.
+			case clientMsg == bsdpMsgTypeList:
+				// INFORM[LIST] -> ACK[LIST]: server priority, default boot
+				// image and the boot image list (bsdpy-style, no version
+				// sub-option).
 				var payload []byte
 				payload = append(payload, bsdpSubOptionMessage, 1, bsdpMsgTypeList)
-				payload = append(payload, bsdpSubOptionVersion, 2)
-				payload = append(payload, bsdpVersion0101[:]...)
-				payload = append(payload, bsdpSubOptionServerID, 4)
-				payload = append(payload, serverIP.To4()...)
-				payload = append(payload, bsdpSubOptionPriority, 2, 0x03, 0xe8)
+				payload = append(payload, bsdpSubOptionPriority, 2, 0xff, 0xff)
 				payload = append(payload, bsdpSubOptionDefaultID, 4)
 				payload = append(payload, byte(imageID>>24), byte(imageID>>16), byte(imageID>>8), byte(imageID))
 				entry := bsdpImageListEntry(imageID, bsdpImageNameForRootPath(rootPath))
@@ -659,7 +662,7 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 				payload = append(payload, entry...)
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, payload))
-			case req.MessageType() == dhcpv4.MessageTypeInform && clientVer >= 0x0101 && clientMsg == bsdpMsgTypeSelect:
+			case clientMsg == bsdpMsgTypeSelect:
 				// INFORM[SELECT] -> ACK[SELECT]: confirm the client's
 				// selected boot image.
 				selected := bsdpClientSelectedImage(req)
@@ -668,17 +671,15 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 				}
 				var payload []byte
 				payload = append(payload, bsdpSubOptionMessage, 1, bsdpMsgTypeSelect)
-				payload = append(payload, bsdpSubOptionVersion, 2)
-				payload = append(payload, bsdpVersion0101[:]...)
 				payload = append(payload, bsdpSubOptionSelectedID, 4)
 				payload = append(payload, byte(selected>>24), byte(selected>>16), byte(selected>>8), byte(selected))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 				d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, payload))
 			case req.MessageType() == dhcpv4.MessageTypeInform:
-				// NetBoot 1.0 clients (version 0x0100 or no version): the
-				// recipe's ppc type-8 branch — BSDP msg type 2 + selected
-				// image. The client boots from the boot file/root path in
-				// this same ACK. i386 1.0 clients: no option 43 (recipe).
+				// NetBoot 1.0 clients: the recipe's ppc type-8 branch — BSDP
+				// msg type 2 + selected image. The client boots from the
+				// boot file/root path in this same ACK. i386 1.0 clients:
+				// no option 43 (recipe).
 				if classified == "apple-ppc" {
 					d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionClassIdentifier, class))
 					d.UpdateOption(dhcpv4.OptGeneric(dhcpv4.OptionVendorSpecificInformation, selectPayload()))
@@ -739,6 +740,16 @@ func bsdpClientVersion(req *dhcpv4.DHCPv4) uint16 {
 	m := bsdpParse(req.Options.Get(dhcpv4.OptionVendorSpecificInformation))
 	if v, ok := m[bsdpSubOptionVersion]; ok && len(v) == 2 {
 		return binary.BigEndian.Uint16(v)
+	}
+	return 0
+}
+
+// bsdpReplyPort extracts the BSDP Reply Port (sub-option 5) the client wants
+// the reply on; 0 when absent (reply to the packet's source port).
+func bsdpReplyPort(req *dhcpv4.DHCPv4) int {
+	m := bsdpParse(req.Options.Get(dhcpv4.OptionVendorSpecificInformation))
+	if p, ok := m[bsdpSubOptionReplyPort]; ok && len(p) == 2 {
+		return int(binary.BigEndian.Uint16(p))
 	}
 	return 0
 }

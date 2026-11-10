@@ -715,9 +715,7 @@ func TestAppleNetBootInform(t *testing.T) {
 	}
 	want43 := []byte{
 		0x01, 0x01, 0x01, // msg type LIST
-		0x02, 0x02, 0x01, 0x01, // version 1.1
-		0x03, 0x04, 10, 0, 0, 1, // server identifier 10.0.0.1
-		0x04, 0x02, 0x03, 0xe8, // priority 1000
+		0x04, 0x02, 0xff, 0xff, // server priority 65535 (bsdpy-style)
 		0x07, 0x04, 0x81, 0x00, 0x10, 0x00, // default boot image
 		0x09, 0x0f, 0x81, 0x00, 0x10, 0x00, 0x0a, 'N', 'e', 't', 'I', 'n', 's', 't', 'a', 'l', 'l', // list entry
 	}
@@ -731,8 +729,7 @@ func TestAppleNetBootInform(t *testing.T) {
 		dhcpv4.WithGeneric(dhcpv4.OptionClassIdentifier, []byte("AAPLBSDPC/ppc")),
 		dhcpv4.WithGeneric(dhcpv4.OptionVendorSpecificInformation, []byte{
 			0x01, 0x01, 0x02, // msg type SELECT
-			0x02, 0x02, 0x01, 0x01, // version 1.1
-			0x08, 0x04, 0x81, 0x10, 0x00, 0x00, // selected boot image
+			0x08, 0x04, 0x81, 0x00, 0x10, 0x00, // selected boot image
 		}),
 	)
 	if err != nil {
@@ -747,8 +744,7 @@ func TestAppleNetBootInform(t *testing.T) {
 	}
 	want43 = []byte{
 		0x01, 0x01, 0x02, // msg type SELECT
-		0x02, 0x02, 0x01, 0x01, // version 1.1
-		0x08, 0x04, 0x81, 0x10, 0x00, 0x00, // selected boot image (echoed)
+		0x08, 0x04, 0x81, 0x00, 0x10, 0x00, // selected boot image (echoed)
 	}
 	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, want43) {
 		t.Errorf("SELECT option 43 = % x, want % x", got, want43)
