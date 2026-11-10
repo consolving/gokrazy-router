@@ -558,10 +558,12 @@ func TestAppleNetBootPPC(t *testing.T) {
 		t.Errorf("ppc option 60 = %q, want AAPLBSDPC/ppc", got)
 	}
 
-	// Non-DISCOVER messages get the static fallback payload from the recipe.
+	// REQUEST gets a proper BSDP SELECT payload (msg type 2 + image ID) —
+	// the recipe's static fallback parsed as garbage sub-options and made
+	// NetBoot 2.0 firmware reject the ACK.
 	resp = appleReply(t, s, appleRequest(dhcpv4.MessageTypeRequest, "AAPLBSDPC/ppc"))
-	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}) {
-		t.Errorf("ppc REQUEST option 43 = % x, want 00 01 02 03 04 05 06 07", got)
+	if got := resp.Options.Get(dhcpv4.OptionVendorSpecificInformation); !bytes.Equal(got, []byte{0x01, 0x01, 0x02, 0x08, 0x04, 0x81, 0x00, 0x10, 0x00}) {
+		t.Errorf("ppc REQUEST option 43 = % x, want SELECT payload", got)
 	}
 
 	// A bare AAPLBSDPC vendor class is treated as ppc (old-world Open Firmware).
