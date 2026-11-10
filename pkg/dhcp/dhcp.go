@@ -586,6 +586,10 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 		if bootFile != "" {
 			log.Printf("dhcp: %s selected %s bootfile=%s", mac, classified, bootFile)
 			d.UpdateOption(dhcpv4.OptBootFileName(bootFile))
+			// Also place the boot file in the packet's file field (like ISC
+			// dhcpd and bsdpy do): Open Firmware reads the file field, not
+			// option 67 — without it the PPC firmware never TFTPs anything.
+			d.BootFileName = bootFile
 		}
 		// Per-MAC root paths override the Apple per-architecture default and
 		// also apply to non-Apple clients (explicit admin intent).
@@ -607,6 +611,9 @@ func (s *Server) replyOptions(mac string, req *dhcpv4.DHCPv4) dhcpv4.Modifier {
 			// stays recipe-style for NetBoot 1.0 clients.
 			if req == nil {
 				return
+			}
+			if debugBSDP := req.Options.Get(dhcpv4.OptionVendorSpecificInformation); len(debugBSDP) > 0 {
+				log.Printf("dhcp: %s client BSDP option 43 = % x (dhcp msg type %v)", mac, debugBSDP, req.MessageType())
 			}
 			imageID := appleImageID
 			if imageID == 0 {

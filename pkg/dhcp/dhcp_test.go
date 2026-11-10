@@ -798,3 +798,28 @@ func TestAppleNetBootInform(t *testing.T) {
 		t.Errorf("LIST per-MAC option 43 = % x, want entry 01 10 00 00 + MacOSX-10.5.8-NetBoot", got43)
 	}
 }
+
+func TestBootFileFieldSet(t *testing.T) {
+	// Open Firmware reads the packet's file field, not option 67 — both must
+	// carry the boot file.
+	s := appleTestServer()
+	resp := appleReply(t, s, appleRequest(dhcpv4.MessageTypeDiscover, "AAPLBSDPC/ppc"))
+	if got := resp.BootFileName; got != "macnbi-ppc/booter" {
+		t.Errorf("packet file field = %q, want macnbi-ppc/booter", got)
+	}
+	if got := string(resp.Options.Get(dhcpv4.OptionBootfileName)); got != "macnbi-ppc/booter" {
+		t.Errorf("option 67 = %q", got)
+	}
+
+	// Legacy PXE clients get the field too (same value as option 67).
+	resp = appleReply(t, s, func() *dhcpv4.DHCPv4 {
+		req, err := dhcpv4.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}())
+	if got := resp.BootFileName; got != "undionly.kpxe" {
+		t.Errorf("legacy packet file field = %q, want undionly.kpxe", got)
+	}
+}
