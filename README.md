@@ -317,7 +317,8 @@ Classic Macs can boot over the network via Apple's BSDP protocol (vendor class `
     "enabled": true,
     "tftpRoot": "/mnt/data/tftpboot",
     "appleNetBoot": true,
-    "appleIntelRootPath": "nfs:10.0.31.1:/mnt/data/netboot:NetInstall.dmg"
+    "appleIntelRootPath": "nfs:10.0.31.1:/mnt/data/netboot:NetInstall-i386.dmg",
+    "applePPCRootPath": "nfs:10.0.31.1:/mnt/data/netboot:NetInstall-ppc.dmg"
   }
 }
 ```
@@ -369,14 +370,63 @@ Workflow (example: Mac OS X 10.6 NetInstall):
 
    ```
    i386/*  → /mnt/sata/tftpboot/macnbi-i386/
-   NetInstall.dmg → /mnt/sata/netboot/NetInstall.dmg
+   NetInstall.dmg → /mnt/sata/netboot/NetInstall-i386.dmg
    ```
 
-   The `.dmg` name must match the last component of `appleIntelRootPath` (default `NetInstall.dmg`); the TFTP and NFS servers serve from disk, so no restart is needed.
+   The `.dmg` name must match the last component of `appleIntelRootPath`; the TFTP and NFS servers serve from disk, so no restart is needed.
 
 5. Boot the client on a scope served by the router (e.g. VLAN 31): power on holding **Option/Alt** and select the network globe. The Mac sends a BSDP DHCPDISCOVER, receives an OFFER with the boot image ID, then a REQUEST/ACK cycle delivers booter path and root-path — the booter loads via TFTP from the router and mounts the `.dmg` via NFS.
 
 The image OS version must be supported by the client's boot ROM; the classic BSDP flow is proven for Mac OS X 10.5/10.6-era Intel Macs (the pocnet recipe) and works for later Intel models that still ship Apple's EFI NetBoot client.
+
+##### Creating a PowerPC (G4/G5) NetInstall image
+
+PowerPC Macs use the same BSDP flow with the `AAPLBSDPC/ppc` vendor class. The router already answers them out of the box: `macnbi-ppc/booter` via TFTP, image ID `0x81000009`, and the root-path from `applePPCRootPath`. Only the image artifacts and one config line differ from the Intel flow.
+
+**Target OS** — a G4 tops out at **Mac OS X 10.5.8** (10.6 is Intel-only); 10.4 Tiger works too. All G4s are New World ROM Macs, i.e. they speak BSDP — Old World machines (pre-1999) do not and are out of scope.
+
+**Build tools** — System Image Utility from the matching [Server Admin Tools](https://support.apple.com/kb/DL831): STA 10.5.7 for a 10.5 image, STA 10.4.x for 10.4. Run the matching SIU version on a Mac running that OS; a PowerPC Mac is the safe path. The `.nbi` arch directory (`ppc/`) follows the **installer source**, not the build machine's CPU.
+
+**Image type** — NetInstall (boots the installer from the network, installs to the G4's own disk) or NetRestore (wipes and restores a prepared volume — destructive). Plain diskless NetBoot — the OS runs entirely from the server — is **not** supported by this setup: it needs an AFP shadow image, which the router does not serve.
+
+**Steps** (example: Mac OS X 10.5 NetInstall for a PowerBook/Mac G4):
+
+1. Source: mount the Mac OS X 10.5 Install DVD (or its `InstallESD.dmg`).
+2. SIU (from Server Admin Tools 10.5.7) → source → **NetInstall Image** → wizard (name, admin account, optional packages, supported models — keep the G4 models checked) → save.
+3. The bundle is PPC-shaped — no `i386/` or `x86_64/`:
+
+   ```
+   MyImage.nbi/
+     NBImageInfo.plist        # ignored by gokrazy-router
+     NetInstall.dmg           # root image, referenced by applePPCRootPath
+     ppc/
+       booter                 # bootloader, fetched via TFTP (DHCP option 67)
+       mach.macosx            # kernel, fetched by the booter via TFTP
+       mach.macosx.mkext      # kernel extension cache, fetched via TFTP
+   ```
+
+   The G4's Open Firmware client uses plain 512-byte TFTP blocks (no RFC 2347 options) — the built-in TFTP server handles that unchanged.
+4. Copy to the router (SMB share):
+
+   ```
+   ppc/*           → /mnt/sata/tftpboot/macnbi-ppc/
+   NetInstall.dmg  → /mnt/sata/netboot/NetInstall-ppc.dmg
+   ```
+
+5. Point the PPC root-path at it — `router.json` (or the extras TOML, root-level keys before the first table):
+
+   ```json
+   "applePPCRootPath": "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall-ppc.dmg"
+   ```
+
+   The `.dmg` name must match the last component. If you serve **both** Intel and PPC images, keep two `.dmg` names and set `appleIntelRootPath` and `applePPCRootPath` separately. Leave `appleImageID` unset unless a specific image ID is required — setting it overrides the defaults for **both** architectures.
+6. Boot the G4 on a served scope (e.g. VLAN 31): power on holding **Option/Alt**, select the network globe. The G4 sends a `AAPLBSDPC/ppc` DHCPDISCOVER; the ACK carries booter path and root-path, the booter loads `mach.macosx` + `mach.macosx.mkext` via TFTP and mounts the `.dmg` via NFS.
+
+Notes:
+
+- Keep the G4's Boot ROM updated to the last version for the model — early ROM revisions are picky about BSDP replies.
+- The PPC DHCP flow uses the fallback option-43 payload on REQUEST (static `00:01:02:…:07` bytes) exactly as the reference recipe does; this is what the recipe validated against 10.5-era clients.
+- The 10.5 installer wants ≥512 MB RAM and a DVD-quality network path — NFS over the built-in server is plenty.
 
 ### Static DHCP reservations
 

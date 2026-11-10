@@ -48,4 +48,7 @@ ipxeScript = "boot.ipxe"
 # nfs:<router-ip-on-the-client-subnet>:<export-path>:<NetInstall.dmg>.
 appleNetBoot = true
 appleIntelBootFile = "macnbi-i386/booter"
-appleIntelRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall.dmg"
+appleIntelRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall-i386.dmg"
+# PowerPC (G4/G5) images: ppc/* -> tftpboot/macnbi-ppc/, dmg -> netboot/NetInstall-ppc.dmg
+applePPCBootFile = "macnbi-ppc/booter"
+applePPCRootPath = "nfs:10.0.31.1:/mnt/sata/netboot:NetInstall-ppc.dmg"
